@@ -6,7 +6,7 @@
 
 services:
   n8n-oidc:
-    image: ghcr.io/kavdau/n8n-oidc:2.0.1
+    image: ghcr.io/kavdau/n8n-oidc:2.0.2
     restart: unless-stopped
     network_mode: none
     volumes:
