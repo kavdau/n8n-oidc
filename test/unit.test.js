@@ -424,9 +424,16 @@ function fakeN8n({ users = [], identities = [], ownerSetUp = true } = {}) {
 		},
 		userRepository: {
 			findOne: async ({ where }) => users.find((u) => (where.email ? u.email === where.email : u.id === where.id)) || null,
-			update: async ({ id }, changes) => {
-				updates.push({ id, ...changes });
-				Object.assign(users.find((u) => u.id === id), changes);
+			findOneBy: async ({ id }) => {
+				const found = users.find((u) => u.id === id);
+				return found ? { ...found } : null;
+			},
+			save: async (entity, options) => {
+				const stored = users.find((u) => u.id === entity.id);
+				const changed = Object.fromEntries(Object.entries(entity).filter(([key, value]) => stored[key] !== value));
+				updates.push({ id: entity.id, ...changed, transaction: options && options.transaction });
+				Object.assign(stored, entity);
+				return entity;
 			},
 			createUserWithProject: async (data) => {
 				const user = { id: `u${users.length + 1}`, ...data };
@@ -539,7 +546,8 @@ test('syncProfile takes over name and verified email, and updates the user objec
 		n8n,
 	);
 	assert.deepEqual(fields.sort(), ['email', 'lastName']);
-	assert.deepEqual(updates, [{ id: 'u1', lastName: 'Smith', email: 'jane.smith@example.com' }]);
+	// Saved as a whole entity in a transaction, so n8n renames the personal project too.
+	assert.deepEqual(updates, [{ id: 'u1', lastName: 'Smith', email: 'jane.smith@example.com', transaction: true }]);
 	// issueCookie() hashes the email, so the object in hand must already carry the new one.
 	assert.equal(user.email, 'jane.smith@example.com');
 });
