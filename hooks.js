@@ -23,7 +23,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { createRequire } = require('node:module');
 
-const HOOK_VERSION = '2.0.1';
+const HOOK_VERSION = '2.0.2';
 const LOG_PREFIX = '[OIDC Hook]';
 const PROVIDER_TYPE = 'oidc';
 
