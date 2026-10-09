@@ -1,109 +1,261 @@
 # n8n-oidc
 
-This project enables OpenID Connect (OIDC) authentication for [n8n](https://n8n.io/) without requiring an enterprise license. It uses n8n's external hooks system to inject OIDC support at runtime.
+OpenID Connect login for **n8n Community Edition**, as an external hook. Works with
+[Pocket ID](https://pocket-id.org), Authentik, Keycloak, Authelia and any other
+standards-compliant provider.
 
-## Features
+- Adds a "Sign in with …" button to the n8n sign-in and owner setup pages
+- Signs users in through n8n's own session handling (`AuthService`), so sessions,
+  cookie flags and sign-out behave exactly like a password login
+- Links accounts the same way n8n's licensed OIDC integration does
+  (`AuthIdentity`, keyed by the provider's `sub`)
+- Never stops n8n from starting: on any problem the hook disables itself and the
+  normal login keeps working
 
-- Standard OIDC authorization code flow
-- Automatic user provisioning (Just-In-Time)
-- First user is automatically assigned the owner role
-- Frontend customization to display an SSO login button
-- Fallback to email/password login via `?showLogin=true`
+> This is a fork of [cweagans/n8n-oidc](https://github.com/cweagans/n8n-oidc),
+> reworked for n8n 2.x. See [What changed](#what-changed-since-the-original).
 
-## Requirements
+**Verified against n8n 2.42.6** (stable) and Pocket ID 2.18.0. CI re-tests weekly
+against the current n8n `stable` and `next` releases.
 
-- Docker and Docker Compose
-- An OIDC provider (e.g., Keycloak, Authentik, [PocketID](https://pocket-id.org), Auth0, Okta)
-- A configured OAuth2/OIDC client with your provider
+## Contents
 
-## Setup
+- [Quick start with Pocket ID](#quick-start-with-pocket-id)
+- [Configuration](#configuration)
+- [How it works](#how-it-works)
+- [Security](#security)
+- [Limitations](#limitations)
+- [Troubleshooting](#troubleshooting)
+- [Upgrading n8n](#upgrading-n8n)
+- [Development and tests](#development-and-tests)
+- [What changed since the original](#what-changed-since-the-original)
 
-### 1. Configure your OIDC provider
+## Quick start with Pocket ID
 
-Create an OAuth2/OIDC client application with your identity provider. Note the following values:
+### 1. Create the client in Pocket ID
 
-- **Client ID**
-- **Client Secret**
-- **Issuer URL** (e.g., `https://auth.example.com`)
+In Pocket ID, open **OIDC Clients → Add OIDC Client**:
 
-Set the redirect URI to: `https://your-n8n-domain.com/auth/oidc/callback`
+| Field | Value |
+| --- | --- |
+| Name | `n8n` |
+| Callback URLs | `https://n8n.example.com/auth/oidc/callback` |
+| Public client | off |
+| PKCE | on |
 
-### 2. Set environment variables
+Save, then copy the **Client ID** and **Client Secret**.
 
-Make sure the following environment variables are set:
+To limit who may use n8n, either restrict the client to a group in Pocket ID
+(**Allowed user groups**), or set `OIDC_ALLOWED_GROUPS` below. Both work; Pocket ID
+then refuses the login before it ever reaches n8n.
+
+### 2. Run n8n with the hook
 
 ```bash
-EXTERNAL_HOOK_FILES=/path/to/hooks.js
-OIDC_ISSUER_URL=https://auth.example.com
-OIDC_CLIENT_ID=your-client-id
-OIDC_CLIENT_SECRET=your-client-secret
-OIDC_REDIRECT_URI=https://n8n.example.com/auth/oidc/callback
-N8N_ADDITIONAL_NON_UI_ROUTES=auth
-EXTERNAL_FRONTEND_HOOKS_URLS=/assets/oidc-frontend-hook.js
+git clone https://github.com/kavdau/n8n-oidc.git && cd n8n-oidc
+cp .env.example .env                       # fill in host, issuer, client id, owner email
+mkdir -p secrets && printf '%s' 'PASTE-CLIENT-SECRET' > secrets/oidc_client_secret
+docker compose up -d
+docker compose logs n8n | grep 'OIDC Hook'
 ```
 
-### 3. Restart n8n
-
-Restart n8n to pick up the environment var changes + the new hooks.js.
-
-## Environment Variables
-
-### Required
-
-| Variable | Description |
-|----------|-------------|
-| `OIDC_ISSUER_URL` | Your OIDC provider's issuer URL |
-| `OIDC_CLIENT_ID` | OAuth2 client ID |
-| `OIDC_CLIENT_SECRET` | OAuth2 client secret |
-| `OIDC_REDIRECT_URI` | The URI that the identity provider will redirect back to. This must be the fully qualified URL with the path `/auth/oidc/callback` (e.g. `https://n8n.example.com/auth/oidc/callback`) |
-| `N8N_ADDITIONAL_NON_UI_ROUTES` | This must be set to `auth` to ensure the OIDC URIs work (causes the frontend to not register routes for those paths) |
-| `EXTERNAL_FRONTEND_HOOKS_URLS` | This must be set to `/assets/oidc-frontend-hook.js`, which is registered and handled by hooks.js |
-
-### Optional
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OIDC_SCOPES` | `openid email profile` | Space-separated list of OIDC scopes |
-
-## How It Works
-
-The `hooks.js` file uses n8n's external hooks feature to:
-
-1. Register custom routes for OIDC authentication:
-   - `GET /auth/oidc/login` - Initiates the OIDC flow
-   - `GET /auth/oidc/callback` - Handles the authorization code exchange
-
-2. Inject a frontend script that replaces the default login form with an SSO button
-
-3. Automatically create user accounts on first login, deriving name and email from OIDC claims
-
-## Accessing the Standard Login Form
-
-To bypass SSO and use email/password authentication, append `?showLogin=true` to the sign-in URL:
+A working setup logs:
 
 ```
-https://your-n8n-domain.com/signin?showLogin=true
+[OIDC Hook] v2.0.1 active on n8n 2.42.6
+[OIDC Hook]   issuer:       https://id.example.com
+[OIDC Hook]   redirect URI: https://n8n.example.com/auth/oidc/callback
 ```
+
+Already running n8n? Add the three hook variables and the `OIDC_*` variables to
+your existing service, and mount `hooks.js` read-only. That is all the compose
+file does.
+
+### 3. Sign in
+
+- **New instance:** the setup page shows the SSO button. Only the user whose
+  verified email equals `OIDC_OWNER_EMAIL` can set the instance up; they become
+  the owner.
+- **Existing instance:** your existing account is linked on first SSO login, if
+  Pocket ID reports the email as verified. Password login keeps working.
+- Everyone else in the allowed group gets a member account on first login
+  (turn that off with `OIDC_AUTO_PROVISION=false`).
+
+## Configuration
+
+### Required by n8n
+
+| Variable | Value |
+| --- | --- |
+| `EXTERNAL_HOOK_FILES` | Path to `hooks.js` |
+| `EXTERNAL_FRONTEND_HOOKS_URLS` | `/assets/oidc-frontend-hook.js` (the button) |
+| `N8N_ADDITIONAL_NON_UI_ROUTES` | must include `auth`, otherwise the editor swallows `/auth/oidc/*` |
+| `N8N_EDITOR_BASE_URL` | The public URL of n8n; used to build the redirect URI |
+
+### Provider
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `OIDC_ISSUER_URL` | *required* | Issuer URL, e.g. `https://id.example.com`. Must match the provider's `issuer` exactly. |
+| `OIDC_CLIENT_ID` | *required* | Client ID |
+| `OIDC_CLIENT_SECRET` / `OIDC_CLIENT_SECRET_FILE` | | Client secret, or a file containing it (Docker secrets). Leave out for a public client. |
+| `OIDC_REDIRECT_URI` | `<N8N_EDITOR_BASE_URL>/auth/oidc/callback` | Only needed if n8n cannot work out its own URL |
+| `OIDC_SCOPES` | `openid email profile` | `groups` is added automatically when `OIDC_ALLOWED_GROUPS` is set |
+| `OIDC_TOKEN_AUTH_METHOD` | `client_secret_basic` (with secret), `none` (without) | Or `client_secret_post` |
+| `OIDC_USE_PKCE` | `true` | PKCE S256. Can only be turned off for confidential clients. |
+
+### Access
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `OIDC_OWNER_EMAIL` | | Allows this user to set up a fresh instance through SSO |
+| `OIDC_ALLOWED_GROUPS` | *(anyone)* | Comma-separated; the user needs at least one |
+| `OIDC_GROUPS_CLAIM` | `groups` | Claim that carries the groups |
+| `OIDC_ALLOWED_EMAIL_DOMAINS` | *(any)* | Comma-separated, exact match (`example.com` does not allow `sub.example.com`) |
+| `OIDC_AUTO_PROVISION` | `true` | Create member accounts on first login. If `false`, users must be invited first. |
+| `OIDC_REQUIRE_EMAIL_VERIFIED` | `true` | Require `email_verified: true` before creating or linking an account. An explicit `false` is always rejected. |
+
+### Sign-in page
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `OIDC_BUTTON_LABEL` | `Sign in with SSO` | Button text |
+| `OIDC_HIDE_PASSWORD_LOGIN` | `false` | Show only the SSO button. A small link (`?showLogin=true`) keeps the password form reachable for the owner. |
+| `OIDC_AUTO_REDIRECT` | `false` | Skip the sign-in page and go straight to the provider. Not after signing out, so you are not signed straight back in. |
+
+### Diagnostics
+
+| Variable | Meaning |
+| --- | --- |
+| `OIDC_DEBUG=true` | Extra log lines |
+| `OIDC_N8N_PACKAGE_DIR` | Path of the n8n package, if the hook cannot find it (non-Docker installs) |
+
+## How it works
+
+```
+Browser ──GET /auth/oidc/login──▶ n8n (hook)
+   │      sets an encrypted, 10-minute cookie with state, nonce, PKCE verifier, target page
+   ◀──302 to Pocket ID (code_challenge=S256, nonce, state)
+   │
+Pocket ID  (passkey)  ──302──▶ /auth/oidc/callback?code&state&iss
+                                  │ checks state (and iss, RFC 9207)
+                                  │ exchanges code + verifier at the token endpoint
+                                  │ verifies the ID token: signature (JWKS), iss, aud, azp, exp, iat, nonce
+                                  │ applies email / group / domain rules
+                                  │ resolves the user: sub ▸ verified email ▸ owner setup ▸ new member
+                                  │ n8n AuthService.issueCookie()  →  normal n8n session
+   ◀──302 to the page the user asked for ─┘
+```
+
+The button is added by a small script served from `/assets/oidc-frontend-hook.js`.
+It only uses n8n's stable `data-test-id` attributes, so it does not depend on
+CSS class names.
+
+## Security
+
+- **ID tokens are verified**, not just decoded: signature against the provider's
+  JWKS (RS256/384/512, PS256/384/512, ES256/384/512, EdDSA; `none` and HMAC are
+  rejected), plus `iss`, `aud`, `azp`, `exp`, `iat`, `nbf` and `nonce`.
+  Rotated keys are picked up automatically.
+- **PKCE S256**, `state`, `nonce` and the authorization response `iss` parameter
+  protect against code injection, CSRF and mix-up attacks.
+- **Account takeover protection:** an existing n8n account is only linked by email
+  when the provider says the email is verified. After that the link uses the
+  immutable `sub`, so changing the email in Pocket ID does not move the account.
+- **Owner setup** is restricted to `OIDC_OWNER_EMAIL`. Without it, a fresh instance
+  can only be set up with the normal form. (The original "first user becomes owner"
+  never triggered on n8n 2.x, see issue #7.)
+- **No reflected provider text:** errors reach the sign-in page as fixed codes
+  (`?oidc_error=access_denied`) with fixed messages.
+- **Open redirects** are blocked: only same-origin paths are accepted as targets.
+- Webhooks, forms and the public API are untouched.
+
+## Limitations
+
+- **Signing out of n8n does not sign you out of Pocket ID.** With
+  `OIDC_AUTO_REDIRECT=true` that is handled (no redirect after a sign-out), but a
+  click on the button signs you in again without a prompt while your Pocket ID
+  session lasts.
+- **n8n's own MFA is not asked** for SSO logins; authentication strength is the
+  provider's job (passkeys in Pocket ID). This matches n8n's licensed OIDC.
+- **Roles are not mapped** from groups. New users are members; promote them in n8n.
+  Admin roles in n8n are a licensed feature, and this hook does not unlock any.
+- **Not a licensed feature.** This hook does not enable n8n Enterprise features,
+  and n8n's own SSO settings page stays locked. It is an independent implementation
+  that uses n8n's public external hooks plus some internal services.
 
 ## Troubleshooting
 
-**OIDC login button doesn't appear**
+Every decision the hook makes is logged with the prefix `[OIDC Hook]`:
 
-- Check that all required environment variables are set
-- Verify the hooks.js file is mounted correctly
-- Check n8n logs for `[OIDC Hook]` messages
+```bash
+docker logs n8n 2>&1 | grep 'OIDC Hook'
+```
 
-**"Missing state cookies" error**
+| Symptom | Cause and fix |
+| --- | --- |
+| n8n does not start, log shows `EACCES: permission denied, open '/opt/n8n-oidc/hooks.js'` | n8n runs as user `node` (UID 1000) and cannot read the mounted file. n8n loads hook files itself, so this happens before the hook can protect anything. `chmod 644 hooks.js` and `chmod 755` on its folder. On NAS systems with ACLs (`+` in `ls -l`), remove them first: `setfacl -b`. |
+| `Cannot read OIDC_CLIENT_SECRET_FILE` | Same permission problem for the secret: `chown 1000:1000` and `chmod 400` the file. |
+| `OIDC login disabled` | The line before it says why: a missing variable, `N8N_ADDITIONAL_NON_UI_ROUTES` without `auth`, or n8n internals not found after an update. n8n keeps running with the normal login. |
+| Log says `Signed in … (provisioned)` but you expected your existing account | The email at the provider differs from the email of your n8n account, so a new member was created. Delete it in **Settings → Users**, make both emails match, and sign in again; the log then says `(linked)`. Set `OIDC_AUTO_PROVISION=false` if only invited users should get in. |
+| `email_not_verified` | The provider does not report the email as verified. Verify it there; only set `OIDC_REQUIRE_EMAIL_VERIFIED=false` if you trust every email the provider hands out. |
+| `session_expired` right after signing in | The transaction cookie did not survive the round trip, usually because `N8N_SECURE_COOKIE` is on while n8n is reached over plain HTTP, or the login was started in another tab. |
+| `X-Forwarded-For` errors in the log | Not from the hook: n8n does not know it is behind a proxy. Set `N8N_PROXY_HOPS=1`. |
 
-- Ensure cookies are enabled in your browser
-- Check that `N8N_PROTOCOL` matches your actual protocol (http/https)
-- If behind a reverse proxy, ensure `N8N_TRUST_PROXY=true` is set
+## Upgrading n8n
 
-**User creation fails**
+The hook relies on a few n8n internals: `AuthService`, `OwnershipService`, the
+`@n8n/db` repositories and the external hooks API. They have been stable through
+n8n 2.x, but they are not a public API.
 
-- Verify your OIDC provider returns an `email` claim
-- Check that the email claim contains a valid email address
+1. Check the [CI status](../../actions) (it tests the newest `stable` and `next`
+   every Monday) or run the tests yourself (below).
+2. Upgrade n8n.
+3. Look for `[OIDC Hook] v… active on n8n <new version>` in the log. If the hook
+   cannot find something, it logs why and disables itself; password login keeps
+   working, so you are never locked out.
+
+## Development and tests
+
+Requires Node 24 (what n8n 2.x needs).
+
+```bash
+node --test test/unit.test.js          # 33 unit tests, no dependencies
+task test-e2e                          # installs n8n from npm, then e2e + browser tests
+```
+
+Or by hand:
+
+```bash
+mkdir -p .n8n-under-test && (cd .n8n-under-test && echo '{}' > package.json && npm i n8n@stable)
+export N8N_BIN=$PWD/.n8n-under-test/node_modules/n8n/bin/n8n
+node --test test/e2e.test.js           # real n8n + mock provider, 22 scenarios
+npm install && node --test test/browser.test.js   # headless Chrome against the real editor
+```
+
+`test/mock-idp.js` is a small provider that behaves like Pocket ID (RS256, PKCE,
+`email_verified`, `groups`) and can misbehave on purpose: forged signatures, wrong
+nonce or audience, expired tokens, `alg: none`.
+
+## What changed since the original
+
+| | Original (n8n 2.1) | This fork |
+| --- | --- | --- |
+| Session | hand-made JWT and hash | n8n's `AuthService.issueCookie()` |
+| n8n internals | fixed `dist/` paths | located at runtime; hook disables itself if missing |
+| ID token | decoded, not verified | signature and all claims verified |
+| PKCE | no | S256 |
+| Account linking | by email, unverified | by `sub`, email only when verified |
+| Owner | "first user", never triggered on 2.x | `OIDC_OWNER_EMAIL` |
+| Access control | none | groups, email domains, auto-provision switch |
+| Errors | provider text in the URL | fixed codes and messages |
+| Button | CSS class selectors, enterprise flag override | `data-test-id` selectors, no flags touched |
+| Tests | none | unit, end-to-end and browser tests, weekly CI against the latest n8n |
+
+Environment variable names and the callback URL are unchanged, so an existing
+setup keeps working after replacing `hooks.js` (add `N8N_EDITOR_BASE_URL` if it is
+not set).
 
 ## License
 
-MIT License. See [LICENSE.md](LICENSE.md) for details.
+MIT. Originally created by Cameron Eagans.

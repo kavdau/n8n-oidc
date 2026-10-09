@@ -3,12 +3,33 @@
 version: '3'
 
 vars:
-  N8N_VERSION: 2.1.1
+  N8N_VERSION: 2.42.6
 
 tasks:
   get-n8n:
-    desc: Checkout n8n source code
+    desc: Check out the n8n source the hook was last verified against
     cmds:
-      - git clone --branch n8n@{{.N8N_VERSION}} https://github.com/n8n-io/n8n.git n8n-src
+      - git clone --depth 1 --branch n8n@{{.N8N_VERSION}} https://github.com/n8n-io/n8n.git n8n-src
     generates:
       - n8n-src
+
+  install-n8n:
+    desc: Install n8n from npm for the end-to-end tests
+    cmds:
+      - mkdir -p .n8n-under-test
+      - cd .n8n-under-test && echo '{"private":true}' > package.json && npm install --no-audit --no-fund n8n@{{.N8N_VERSION}}
+
+  test:
+    desc: Unit tests
+    cmds:
+      - node --test test/unit.test.js
+
+  test-e2e:
+    desc: End-to-end and browser tests against the installed n8n
+    deps: [install-n8n]
+    env:
+      N8N_BIN: '{{.ROOT_DIR}}/.n8n-under-test/node_modules/n8n/bin/n8n'
+    cmds:
+      - node --test --test-timeout=400000 test/e2e.test.js
+      - npm install --no-audit --no-fund
+      - node --test --test-timeout=400000 test/browser.test.js

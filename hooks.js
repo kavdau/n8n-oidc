@@ -1,698 +1,1219 @@
 /**
- * n8n External Hooks for OIDC Authentication
+ * n8n-oidc: bolt-on OpenID Connect login for n8n Community Edition.
  *
- * This file implements OIDC authentication support for n8n using only built-in Node.js modules.
- * It provides:
- * - OIDC discovery endpoint support
- * - Authorization code flow
- * - User provisioning (JIT - Just In Time)
- * - Frontend customization to show OIDC login button
+ * Loaded by n8n through EXTERNAL_HOOK_FILES. It registers three routes:
+ *   GET /auth/oidc/login     starts the authorization code flow (PKCE)
+ *   GET /auth/oidc/callback  validates the response and signs the user in
+ *   GET /assets/oidc-frontend-hook.js  adds the SSO button to the sign-in page
  *
- * Environment Variables Required:
- * - OIDC_ISSUER_URL: The OIDC provider's issuer URL (e.g., https://auth.example.com)
- * - OIDC_CLIENT_ID: OAuth2 client ID
- * - OIDC_CLIENT_SECRET: OAuth2 client secret
- * - OIDC_REDIRECT_URI: The callback URL (e.g., https://n8n.example.com/auth/oidc/callback)
+ * Sessions are issued through n8n's own AuthService, accounts are linked through
+ * n8n's AuthIdentity table (providerType "oidc", providerId = OIDC "sub"), the
+ * same data model the licensed OIDC integration uses.
  *
- * Optional:
- * - OIDC_SCOPES: Space-separated list of scopes (default: "openid email profile")
+ * Nothing in this file may stop n8n from starting: every failure while setting
+ * up is logged and the hook disables itself, leaving the normal login in place.
+ *
+ * Originally created by Cameron Eagans (https://github.com/cweagans/n8n-oidc), MIT.
  */
 
-const https = require('https');
-const http = require('http');
-const crypto = require('crypto');
-const { URL, URLSearchParams } = require('url');
+'use strict';
 
-// Configuration from environment
-const config = {
-  issuerUrl: process.env.OIDC_ISSUER_URL,
-  clientId: process.env.OIDC_CLIENT_ID,
-  clientSecret: process.env.OIDC_CLIENT_SECRET,
-  redirectUri: process.env.OIDC_REDIRECT_URI,
-  scopes: process.env.OIDC_SCOPES || 'openid email profile',
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+const { createRequire } = require('node:module');
+
+const HOOK_VERSION = '2.0.1';
+const LOG_PREFIX = '[OIDC Hook]';
+const PROVIDER_TYPE = 'oidc';
+
+const ROUTE_LOGIN = '/auth/oidc/login';
+const ROUTE_CALLBACK = '/auth/oidc/callback';
+const ROUTE_FRONTEND = '/assets/oidc-frontend-hook.js';
+
+const TX_COOKIE = 'n8n-oidc-tx';
+const TX_COOKIE_PATH = '/auth/oidc';
+const TX_MAX_AGE_SECONDS = 10 * 60;
+
+const HTTP_TIMEOUT_MS = 10_000;
+const DISCOVERY_TTL_MS = 60 * 60 * 1000;
+const JWKS_TTL_MS = 60 * 60 * 1000;
+const JWKS_MIN_REFRESH_MS = 30 * 1000;
+const CLOCK_SKEW_SECONDS = 60;
+const NAME_MAX_LENGTH = 32;
+
+/** Error codes the sign-in page knows how to explain. Never reflect IdP text. */
+const ERROR_CODES = new Set([
+	'login_failed',
+	'session_expired',
+	'access_denied',
+	'email_not_verified',
+	'email_missing',
+	'not_provisioned',
+	'instance_not_setup',
+	'user_disabled',
+]);
+
+const log = {
+	info: (...args) => console.log(LOG_PREFIX, ...args),
+	warn: (...args) => console.warn(LOG_PREFIX, ...args),
+	error: (...args) => console.error(LOG_PREFIX, ...args),
+	debug: (...args) => {
+		if (process.env.OIDC_DEBUG === 'true') console.log(LOG_PREFIX, '[debug]', ...args);
+	},
 };
 
-// Validate configuration
-function validateConfig() {
-  const missing = [];
-  if (!config.issuerUrl) missing.push('OIDC_ISSUER_URL');
-  if (!config.clientId) missing.push('OIDC_CLIENT_ID');
-  if (!config.clientSecret) missing.push('OIDC_CLIENT_SECRET');
-  if (!config.redirectUri) missing.push('OIDC_REDIRECT_URI');
-  return missing;
+class OidcLoginError extends Error {
+	/**
+	 * @param {string} code one of ERROR_CODES, shown to the user
+	 * @param {string} detail logged only
+	 */
+	constructor(code, detail) {
+		super(detail || code);
+		this.code = ERROR_CODES.has(code) ? code : 'login_failed';
+	}
 }
 
-// Cache for OIDC discovery document
-let discoveryCache = null;
-let discoveryCacheTime = 0;
-const DISCOVERY_CACHE_TTL = 3600000; // 1 hour
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
 
-/**
- * Make an HTTP/HTTPS request
- * @param {string} url - The URL to request
- * @param {object} options - Request options
- * @returns {Promise<{statusCode: number, headers: object, body: string}>}
- */
-function makeRequest(url, options = {}) {
-  return new Promise((resolve, reject) => {
-    const parsedUrl = new URL(url);
-    const protocol = parsedUrl.protocol === 'https:' ? https : http;
+/** Reads NAME, or the file named by NAME_FILE (Docker secrets). */
+function readEnv(name, env = process.env) {
+	const file = env[`${name}_FILE`];
+	if (file) {
+		try {
+			return fs.readFileSync(file, 'utf8').trim();
+		} catch (error) {
+			throw new Error(`Cannot read ${name}_FILE (${file}): ${error.message}`);
+		}
+	}
+	const value = env[name];
+	return value === undefined || value.trim() === '' ? undefined : value.trim();
+}
 
-    const reqOptions = {
-      hostname: parsedUrl.hostname,
-      port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
-      path: parsedUrl.pathname + parsedUrl.search,
-      method: options.method || 'GET',
-      headers: options.headers || {},
-    };
+function parseBool(value, fallback) {
+	if (value === undefined) return fallback;
+	const normalized = value.toLowerCase();
+	if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+	if (['false', '0', 'no', 'off'].includes(normalized)) return false;
+	throw new Error(`Expected a boolean but got "${value}"`);
+}
 
-    const req = protocol.request(reqOptions, (res) => {
-      let body = '';
-      res.on('data', (chunk) => (body += chunk));
-      res.on('end', () => {
-        resolve({
-          statusCode: res.statusCode,
-          headers: res.headers,
-          body,
-        });
-      });
-    });
+function parseList(value) {
+	if (!value) return [];
+	return value
+		.split(/[,\s]+/)
+		.map((item) => item.trim())
+		.filter(Boolean);
+}
 
-    req.on('error', reject);
-
-    if (options.body) {
-      req.write(options.body);
-    }
-
-    req.end();
-  });
+function stripTrailingSlash(url) {
+	return url.replace(/\/+$/, '');
 }
 
 /**
- * Fetch OIDC discovery document
- * @returns {Promise<object>}
+ * Builds the hook configuration from the environment.
+ * Returns `{ config }` or `{ missing }` when required values are absent.
  */
-async function fetchDiscoveryDocument() {
-  const now = Date.now();
-  if (discoveryCache && now - discoveryCacheTime < DISCOVERY_CACHE_TTL) {
-    return discoveryCache;
-  }
+function loadConfig(env = process.env) {
+	const issuerUrl = readEnv('OIDC_ISSUER_URL', env);
+	const clientId = readEnv('OIDC_CLIENT_ID', env);
+	const missing = [];
+	if (!issuerUrl) missing.push('OIDC_ISSUER_URL');
+	if (!clientId) missing.push('OIDC_CLIENT_ID');
+	if (missing.length) return { missing };
 
-  const discoveryUrl = config.issuerUrl.replace(/\/$/, '') + '/.well-known/openid-configuration';
-  const response = await makeRequest(discoveryUrl);
+	const clientSecret = readEnv('OIDC_CLIENT_SECRET', env);
+	const allowedGroups = parseList(readEnv('OIDC_ALLOWED_GROUPS', env));
 
-  if (response.statusCode !== 200) {
-    throw new Error(`Failed to fetch OIDC discovery document: ${response.statusCode}`);
-  }
+	let scopes = parseList(readEnv('OIDC_SCOPES', env) || 'openid email profile');
+	if (!scopes.includes('openid')) scopes.unshift('openid');
+	if (allowedGroups.length && !scopes.includes('groups')) scopes.push('groups');
 
-  discoveryCache = JSON.parse(response.body);
-  discoveryCacheTime = now;
-  return discoveryCache;
+	const tokenAuthMethod =
+		readEnv('OIDC_TOKEN_AUTH_METHOD', env) || (clientSecret ? 'client_secret_basic' : 'none');
+	if (!['client_secret_basic', 'client_secret_post', 'none'].includes(tokenAuthMethod)) {
+		throw new Error(`Unsupported OIDC_TOKEN_AUTH_METHOD "${tokenAuthMethod}"`);
+	}
+	if (tokenAuthMethod !== 'none' && !clientSecret) {
+		throw new Error(`OIDC_TOKEN_AUTH_METHOD=${tokenAuthMethod} needs OIDC_CLIENT_SECRET`);
+	}
+
+	const usePkce = parseBool(readEnv('OIDC_USE_PKCE', env), true);
+	if (tokenAuthMethod === 'none' && !usePkce) {
+		throw new Error('A public client (no client secret) must use PKCE');
+	}
+
+	const ownerEmail = readEnv('OIDC_OWNER_EMAIL', env);
+
+	return {
+		config: {
+			issuerUrl: stripTrailingSlash(issuerUrl),
+			clientId,
+			clientSecret,
+			tokenAuthMethod,
+			usePkce,
+			redirectUri: readEnv('OIDC_REDIRECT_URI', env),
+			scopes: scopes.join(' '),
+			allowedGroups,
+			groupsClaim: readEnv('OIDC_GROUPS_CLAIM', env) || 'groups',
+			allowedEmailDomains: parseList(readEnv('OIDC_ALLOWED_EMAIL_DOMAINS', env)).map((d) =>
+				d.toLowerCase().replace(/^@/, ''),
+			),
+			autoProvision: parseBool(readEnv('OIDC_AUTO_PROVISION', env), true),
+			requireEmailVerified: parseBool(readEnv('OIDC_REQUIRE_EMAIL_VERIFIED', env), true),
+			ownerEmail: ownerEmail ? ownerEmail.toLowerCase() : undefined,
+			buttonLabel: readEnv('OIDC_BUTTON_LABEL', env) || 'Sign in with SSO',
+			hidePasswordLogin: parseBool(readEnv('OIDC_HIDE_PASSWORD_LOGIN', env), false),
+			autoRedirect: parseBool(readEnv('OIDC_AUTO_REDIRECT', env), false),
+		},
+	};
 }
 
-/**
- * Generate a random string for state/nonce
- * @param {number} length
- * @returns {string}
- */
-function generateRandomString(length = 32) {
-  return crypto.randomBytes(length).toString('hex');
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+function base64UrlEncode(buffer) {
+	return Buffer.from(buffer).toString('base64url');
 }
 
-/**
- * Base64URL encode
- * @param {Buffer|string} input
- * @returns {string}
- */
-function base64UrlEncode(input) {
-  const base64 = Buffer.isBuffer(input) ? input.toString('base64') : Buffer.from(input).toString('base64');
-  return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-}
-
-/**
- * Base64URL decode
- * @param {string} input
- * @returns {Buffer}
- */
 function base64UrlDecode(input) {
-  let base64 = input.replace(/-/g, '+').replace(/_/g, '/');
-  while (base64.length % 4) {
-    base64 += '=';
-  }
-  return Buffer.from(base64, 'base64');
+	if (typeof input !== 'string' || !/^[A-Za-z0-9_-]*$/.test(input)) {
+		throw new Error('Invalid base64url input');
+	}
+	return Buffer.from(input, 'base64url');
 }
 
-/**
- * Decode JWT without verification (for extracting claims)
- * @param {string} token
- * @returns {object}
- */
-function decodeJwt(token) {
-  const parts = token.split('.');
-  if (parts.length !== 3) {
-    throw new Error('Invalid JWT format');
-  }
-
-  const payload = JSON.parse(base64UrlDecode(parts[1]).toString('utf8'));
-  return payload;
+function randomToken(bytes = 32) {
+	return base64UrlEncode(crypto.randomBytes(bytes));
 }
 
-/**
- * Exchange authorization code for tokens
- * @param {string} code
- * @param {object} discovery
- * @returns {Promise<object>}
- */
-async function exchangeCodeForTokens(code, discovery) {
-  const params = new URLSearchParams({
-    grant_type: 'authorization_code',
-    code,
-    redirect_uri: config.redirectUri,
-    client_id: config.clientId,
-    client_secret: config.clientSecret,
-  });
-
-  const response = await makeRequest(discovery.token_endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: params.toString(),
-  });
-
-  if (response.statusCode !== 200) {
-    console.error('Token exchange failed:', response.body);
-    throw new Error(`Token exchange failed: ${response.statusCode}`);
-  }
-
-  return JSON.parse(response.body);
+function pkceChallenge(verifier) {
+	return base64UrlEncode(crypto.createHash('sha256').update(verifier).digest());
 }
 
-/**
- * Fetch user info from OIDC provider
- * @param {string} accessToken
- * @param {object} discovery
- * @returns {Promise<object>}
- */
-async function fetchUserInfo(accessToken, discovery) {
-  const response = await makeRequest(discovery.userinfo_endpoint, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-    },
-  });
-
-  if (response.statusCode !== 200) {
-    console.error('UserInfo fetch failed:', response.body);
-    throw new Error(`UserInfo fetch failed: ${response.statusCode}`);
-  }
-
-  return JSON.parse(response.body);
-}
-
-/**
- * Create a signed JWT for state/nonce storage
- * We use the JWT service from n8n when available, but for cookies we just use HMAC
- * @param {object} payload
- * @param {string} secret
- * @param {number} expiresInSeconds
- * @returns {string}
- */
-function createSignedCookie(payload, secret, expiresInSeconds = 900) {
-  const exp = Math.floor(Date.now() / 1000) + expiresInSeconds;
-  const data = JSON.stringify({ ...payload, exp });
-  const hmac = crypto.createHmac('sha256', secret);
-  hmac.update(data);
-  const signature = hmac.digest('hex');
-  return base64UrlEncode(data) + '.' + signature;
-}
-
-/**
- * Verify and decode a signed cookie
- * @param {string} cookie
- * @param {string} secret
- * @returns {object|null}
- */
-function verifySignedCookie(cookie, secret) {
-  try {
-    const [dataB64, signature] = cookie.split('.');
-    const data = base64UrlDecode(dataB64).toString('utf8');
-
-    const hmac = crypto.createHmac('sha256', secret);
-    hmac.update(data);
-    const expectedSignature = hmac.digest('hex');
-
-    if (signature !== expectedSignature) {
-      return null;
-    }
-
-    const payload = JSON.parse(data);
-    if (payload.exp && payload.exp < Date.now() / 1000) {
-      return null;
-    }
-
-    return payload;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Get or create the cookie signing secret
- * We derive it from the n8n encryption key if available
- * @param {object} context
- * @returns {string}
- */
-function getCookieSecret(context) {
-  // Use a combination of environment variables to create a stable secret
-  const baseKey = process.env.N8N_ENCRYPTION_KEY || process.env.OIDC_CLIENT_SECRET || 'n8n-oidc-hook-secret';
-  const hash = crypto.createHash('sha256').update(baseKey + '-oidc-state').digest('hex');
-  return hash;
-}
-
-/**
- * Create the n8n auth cookie using n8n's JwtService
- * @param {object} user
- * @param {object} jwtService - n8n's JwtService instance
- * @returns {string}
- */
-function createAuthToken(user, jwtService) {
-  // n8n's JWT contains: { id, hash, browserId?, usedMfa? }
-  const payload = {
-    id: user.id,
-    hash: createUserHash(user),
-    usedMfa: false,
-  };
-
-  return jwtService.sign(payload, { expiresIn: '7d' });
-}
-
-/**
- * Create user hash for JWT (mimics n8n's AuthService.createJWTHash)
- * @param {object} user
- * @returns {string}
- */
-function createUserHash(user) {
-  const payload = [user.email, user.password || ''];
-  if (user.mfaEnabled && user.mfaSecret) {
-    payload.push(user.mfaSecret.substring(0, 3));
-  }
-  return crypto.createHash('sha256').update(payload.join(':')).digest('base64').substring(0, 10);
-}
-
-/**
- * Check if email is valid
- * @param {string} email
- * @returns {boolean}
- */
 function isValidEmail(email) {
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  return emailRegex.test(email);
+	return typeof email === 'string' && email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
-// n8n module paths (specific to the Docker image)
-const N8N_DI_PATH = '/usr/local/lib/node_modules/n8n/node_modules/@n8n/di';
-const N8N_JWT_SERVICE_PATH = '/usr/local/lib/node_modules/n8n/dist/services/jwt.service.js';
+/**
+ * Accepts only same-origin, absolute paths ("/workflow/1?x=y").
+ * Anything else ("//evil", "https://...", "/\\evil", control chars) becomes "/".
+ */
+function sanitizeRedirectPath(value) {
+	if (typeof value !== 'string' || value.length === 0 || value.length > 2048) return '/';
+	if (!value.startsWith('/') || value.startsWith('//') || value.startsWith('/\\')) return '/';
+	if (/[\u0000-\u001f\u007f\\]/.test(value)) return '/';
+	try {
+		const parsed = new URL(value, 'http://n8n.invalid');
+		if (parsed.origin !== 'http://n8n.invalid') return '/';
+		const result = parsed.pathname + parsed.search + parsed.hash;
+		// Never send the user back into the login flow itself.
+		if (result.startsWith('/auth/oidc') || result.startsWith('/signin')) return '/';
+		return result;
+	} catch {
+		return '/';
+	}
+}
 
-// Export the hooks
-module.exports = {
-  n8n: {
-    /**
-     * Called when n8n is ready
-     * We use this to register custom routes for OIDC
-     */
-    ready: [
-      async function (server, n8nConfig) {
-        const missing = validateConfig();
-        if (missing.length > 0) {
-          console.warn(`[OIDC Hook] Missing configuration: ${missing.join(', ')}. OIDC disabled.`);
-          return;
-        }
+function truncate(value, max = NAME_MAX_LENGTH) {
+	if (typeof value !== 'string') return undefined;
+	const trimmed = value.trim();
+	return trimmed ? Array.from(trimmed).slice(0, max).join('') : undefined;
+}
 
-        console.log('[OIDC Hook] Initializing OIDC authentication...');
+function claimToList(value) {
+	if (Array.isArray(value)) return value.filter((v) => typeof v === 'string');
+	if (typeof value === 'string') return parseList(value);
+	return [];
+}
 
-        // Get n8n's JwtService from the DI container
-        const { Container } = require(N8N_DI_PATH);
-        const { JwtService } = require(N8N_JWT_SERVICE_PATH);
-        const jwtService = Container.get(JwtService);
+function isTrue(value) {
+	return value === true || value === 'true';
+}
 
-        const { app } = server;
-        const cookieSecret = getCookieSecret();
+function isFalse(value) {
+	return value === false || value === 'false';
+}
 
-        // Cookie settings
-        const cookieOptions = {
-          httpOnly: true,
-          secure: process.env.N8N_PROTOCOL === 'https',
-          sameSite: 'lax',
-          maxAge: 15 * 60 * 1000, // 15 minutes
-        };
+// ---------------------------------------------------------------------------
+// Transaction cookie (state, nonce, PKCE verifier, redirect) - AES-256-GCM
+// ---------------------------------------------------------------------------
 
-        const authCookieOptions = {
-          httpOnly: true,
-          secure: process.env.N8N_PROTOCOL === 'https',
-          sameSite: 'lax',
-          maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-        };
+function deriveCookieKey(secret) {
+	return Buffer.from(
+		crypto.hkdfSync('sha256', Buffer.from(secret, 'utf8'), 'n8n-oidc', 'oidc-transaction-cookie', 32),
+	);
+}
 
-        /**
-         * OIDC Login endpoint - redirects to the OIDC provider
-         */
-        app.get('/auth/oidc/login', async (req, res) => {
-          try {
-            const discovery = await fetchDiscoveryDocument();
+function sealTransaction(payload, key, now = Date.now()) {
+	const iv = crypto.randomBytes(12);
+	const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+	const body = JSON.stringify({ ...payload, iat: Math.floor(now / 1000) });
+	const encrypted = Buffer.concat([cipher.update(body, 'utf8'), cipher.final()]);
+	return [iv, encrypted, cipher.getAuthTag()].map(base64UrlEncode).join('.');
+}
 
-            const state = generateRandomString();
-            const nonce = generateRandomString();
+function openTransaction(sealed, key, now = Date.now()) {
+	try {
+		if (typeof sealed !== 'string') return null;
+		const [iv, encrypted, tag] = sealed.split('.').map(base64UrlDecode);
+		if (!iv || !encrypted || !tag || iv.length !== 12 || tag.length !== 16) return null;
+		const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+		decipher.setAuthTag(tag);
+		const body = Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
+		const payload = JSON.parse(body);
+		const age = Math.floor(now / 1000) - payload.iat;
+		if (!Number.isFinite(age) || age < -CLOCK_SKEW_SECONDS || age > TX_MAX_AGE_SECONDS) return null;
+		return payload;
+	} catch {
+		return null;
+	}
+}
 
-            // Store state and nonce in signed cookies
-            const stateCookie = createSignedCookie({ state }, cookieSecret);
-            const nonceCookie = createSignedCookie({ nonce }, cookieSecret);
+function safeEqual(a, b) {
+	if (typeof a !== 'string' || typeof b !== 'string') return false;
+	const left = Buffer.from(a);
+	const right = Buffer.from(b);
+	return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
 
-            res.cookie('n8n-oidc-state', stateCookie, cookieOptions);
-            res.cookie('n8n-oidc-nonce', nonceCookie, cookieOptions);
+// ---------------------------------------------------------------------------
+// HTTP
+// ---------------------------------------------------------------------------
 
-            // Build authorization URL
-            const authUrl = new URL(discovery.authorization_endpoint);
-            authUrl.searchParams.set('client_id', config.clientId);
-            authUrl.searchParams.set('redirect_uri', config.redirectUri);
-            authUrl.searchParams.set('response_type', 'code');
-            authUrl.searchParams.set('scope', config.scopes);
-            authUrl.searchParams.set('state', state);
-            authUrl.searchParams.set('nonce', nonce);
+async function fetchJson(url, options = {}) {
+	let response;
+	try {
+		response = await fetch(url, {
+			...options,
+			headers: { Accept: 'application/json', ...(options.headers || {}) },
+			signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+			redirect: 'error',
+		});
+	} catch (error) {
+		throw new Error(`Request to ${url} failed: ${error.message}`);
+	}
+	const text = await response.text();
+	let body;
+	try {
+		body = text ? JSON.parse(text) : {};
+	} catch {
+		throw new Error(
+			`Expected JSON from ${url} but got HTTP ${response.status} ${response.headers.get('content-type') || ''}: ${text.slice(0, 200)}`,
+		);
+	}
+	if (!response.ok) {
+		const detail = body && (body.error_description || body.error) ? `${body.error}: ${body.error_description || ''}` : text.slice(0, 200);
+		throw new Error(`HTTP ${response.status} from ${url}: ${detail}`);
+	}
+	return body;
+}
 
-            res.redirect(authUrl.toString());
-          } catch (error) {
-            console.error('[OIDC Hook] Login error:', error);
-            res.status(500).send('OIDC configuration error. Please check the logs.');
-          }
-        });
+// ---------------------------------------------------------------------------
+// OIDC provider (discovery, JWKS, token exchange, ID token validation)
+// ---------------------------------------------------------------------------
 
-        /**
-         * OIDC Callback endpoint - handles the authorization code
-         */
-        app.get('/auth/oidc/callback', async (req, res) => {
-          try {
-            const { code, state, error, error_description } = req.query;
-
-            // Handle OIDC errors
-            if (error) {
-              console.error('[OIDC Hook] OIDC error:', error, error_description);
-              return res.redirect('/signin?error=' + encodeURIComponent(error_description || error));
-            }
-
-            if (!code || !state) {
-              return res.redirect('/signin?error=' + encodeURIComponent('Missing authorization code or state'));
-            }
-
-            // Verify state
-            const stateCookie = req.cookies['n8n-oidc-state'];
-            const nonceCookie = req.cookies['n8n-oidc-nonce'];
-
-            if (!stateCookie || !nonceCookie) {
-              return res.redirect('/signin?error=' + encodeURIComponent('Missing state cookies - session expired'));
-            }
-
-            const statePayload = verifySignedCookie(stateCookie, cookieSecret);
-            const noncePayload = verifySignedCookie(nonceCookie, cookieSecret);
-
-            if (!statePayload || statePayload.state !== state) {
-              return res.redirect('/signin?error=' + encodeURIComponent('Invalid state - possible CSRF attack'));
-            }
-
-            // Clear state cookies
-            res.clearCookie('n8n-oidc-state');
-            res.clearCookie('n8n-oidc-nonce');
-
-            // Exchange code for tokens
-            const discovery = await fetchDiscoveryDocument();
-            const tokens = await exchangeCodeForTokens(code, discovery);
-
-            // Verify nonce in ID token if present
-            if (tokens.id_token) {
-              const idTokenClaims = decodeJwt(tokens.id_token);
-              if (noncePayload && idTokenClaims.nonce !== noncePayload.nonce) {
-                return res.redirect('/signin?error=' + encodeURIComponent('Invalid nonce - possible replay attack'));
-              }
-            }
-
-            // Get user info
-            let userInfo;
-            try {
-              userInfo = await fetchUserInfo(tokens.access_token, discovery);
-            } catch (e) {
-              // Fall back to ID token claims if userinfo endpoint fails
-              if (tokens.id_token) {
-                userInfo = decodeJwt(tokens.id_token);
-              } else {
-                throw e;
-              }
-            }
-
-            // Validate we have an email
-            if (!userInfo.email || !isValidEmail(userInfo.email)) {
-              return res.redirect('/signin?error=' + encodeURIComponent('No valid email in OIDC response'));
-            }
-
-            // Find or create user in n8n database
-            const { User, Settings, Credentials, Workflow } = this.dbCollections;
-
-            // Try to find existing user by email
-            let user = await User.findOne({
-              where: { email: userInfo.email },
-              relations: ['role'],
-            });
-
-            if (!user) {
-              // Check if this is the first user (should be owner)
-              const userCount = await User.count();
-
-              const userData = {
-                email: userInfo.email,
-                firstName: userInfo.given_name || userInfo.name?.split(' ')[0] || 'User',
-                lastName: userInfo.family_name || userInfo.name?.split(' ').slice(1).join(' ') || '',
-                password: crypto.randomBytes(32).toString('hex'), // Random password, can't be used
-                role: { slug: userCount === 0 ? 'global:owner' : 'global:member' },
-              };
-
-              // Use createUserWithProject to create both user and personal project
-              const result = await User.createUserWithProject(userData);
-              user = result.user;
-
-              console.log(`[OIDC Hook] Created ${userCount === 0 ? 'owner' : 'member'} user with personal project: ${userInfo.email}`);
-            }
-
-            if (!user) {
-              return res.redirect('/signin?error=' + encodeURIComponent('Failed to create or find user'));
-            }
-
-            // Create auth token using n8n's JwtService
-            const authToken = createAuthToken(user, jwtService);
-
-            // Set the n8n auth cookie
-            res.cookie('n8n-auth', authToken, authCookieOptions);
-
-            // Redirect to home
-            res.redirect('/');
-          } catch (error) {
-            console.error('[OIDC Hook] Callback error:', error);
-            res.redirect('/signin?error=' + encodeURIComponent('Authentication failed: ' + error.message));
-          }
-        });
-
-        /**
-         * Serve the frontend customization script
-         * This script will replace the login form with an OIDC button
-         *
-         * NOTE: The route must be under /assets/ or another non-UI route prefix
-         * to avoid being intercepted by n8n's history API handler which would
-         * serve index.html instead of our JavaScript file.
-         */
-        app.get('/assets/oidc-frontend-hook.js', (req, res) => {
-          // Use res.type() for proper MIME type handling with nosniff
-          res.type('text/javascript; charset=utf-8');
-          res.set('Cache-Control', 'public, max-age=3600');
-          res.send(getFrontendScript());
-        });
-
-        console.log('[OIDC Hook] OIDC routes registered:');
-        console.log('  - GET /auth/oidc/login');
-        console.log('  - GET /auth/oidc/callback');
-        console.log('  - GET /assets/oidc-frontend-hook.js');
-      },
-    ],
-  },
-
-  frontend: {
-    /**
-     * Modify frontend settings to configure SSO display
-     */
-    settings: [
-      async function (frontendSettings) {
-        const missing = validateConfig();
-        if (missing.length > 0) {
-          return; // OIDC not configured, don't modify settings
-        }
-
-        // Enable OIDC login button by setting these properties
-        // This tells the frontend that OIDC is available
-        frontendSettings.sso = frontendSettings.sso || {};
-        frontendSettings.sso.oidc = {
-          loginEnabled: true,
-          loginUrl: '/auth/oidc/login',
-          callbackUrl: config.redirectUri,
-        };
-
-        // Set authentication method to OIDC so the frontend knows SSO is primary
-        frontendSettings.userManagement = frontendSettings.userManagement || {};
-        frontendSettings.userManagement.authenticationMethod = 'oidc';
-
-        // Enable enterprise OIDC feature flag so the SSO button shows
-        frontendSettings.enterprise = frontendSettings.enterprise || {};
-        frontendSettings.enterprise.oidc = true;
-
-        console.log('[OIDC Hook] Frontend settings configured for OIDC');
-      },
-    ],
-  },
+const JWS_ALGORITHMS = {
+	RS256: { kty: 'RSA', hash: 'sha256', padding: crypto.constants.RSA_PKCS1_PADDING },
+	RS384: { kty: 'RSA', hash: 'sha384', padding: crypto.constants.RSA_PKCS1_PADDING },
+	RS512: { kty: 'RSA', hash: 'sha512', padding: crypto.constants.RSA_PKCS1_PADDING },
+	PS256: { kty: 'RSA', hash: 'sha256', padding: crypto.constants.RSA_PKCS1_PSS_PADDING },
+	PS384: { kty: 'RSA', hash: 'sha384', padding: crypto.constants.RSA_PKCS1_PSS_PADDING },
+	PS512: { kty: 'RSA', hash: 'sha512', padding: crypto.constants.RSA_PKCS1_PSS_PADDING },
+	ES256: { kty: 'EC', hash: 'sha256', crv: 'P-256' },
+	ES384: { kty: 'EC', hash: 'sha384', crv: 'P-384' },
+	ES512: { kty: 'EC', hash: 'sha512', crv: 'P-521' },
+	EdDSA: { kty: 'OKP', hash: null },
 };
 
-/**
- * Generate the frontend customization script
- * This script runs in the browser and customizes the login page
- */
-function getFrontendScript() {
-  return `
-/**
- * n8n OIDC Frontend Customization
- *
- * This script surgically modifies the login form to show an SSO button.
- * To access the normal login form, add ?showLogin=true to the URL.
- */
-(function() {
-	'use strict';
+function verifyJwsSignature(alg, jwk, signingInput, signature) {
+	const spec = JWS_ALGORITHMS[alg];
+	if (!spec) throw new Error(`Unsupported signing algorithm ${alg}`);
+	if (jwk.kty !== spec.kty) throw new Error(`Key type ${jwk.kty} does not match ${alg}`);
+	if (spec.crv && jwk.crv !== spec.crv) throw new Error(`Curve ${jwk.crv} does not match ${alg}`);
+	if (jwk.alg && jwk.alg !== alg) throw new Error(`Key is restricted to ${jwk.alg}`);
 
-	function shouldShowNormalLogin() {
-		return new URLSearchParams(window.location.search).get('showLogin') === 'true';
+	const key = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+	const data = Buffer.from(signingInput, 'ascii');
+	if (spec.kty === 'RSA') {
+		return crypto.verify(
+			spec.hash,
+			data,
+			{ key, padding: spec.padding, saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST },
+			signature,
+		);
+	}
+	if (spec.kty === 'EC') {
+		return crypto.verify(spec.hash, data, { key, dsaEncoding: 'ieee-p1363' }, signature);
+	}
+	return crypto.verify(null, data, key, signature);
+}
+
+function decodeJwt(token) {
+	if (typeof token !== 'string') throw new Error('Token is not a string');
+	const parts = token.split('.');
+	if (parts.length !== 3) throw new Error('Token is not a compact JWS');
+	const header = JSON.parse(base64UrlDecode(parts[0]).toString('utf8'));
+	const claims = JSON.parse(base64UrlDecode(parts[1]).toString('utf8'));
+	if (!header || typeof header !== 'object' || !claims || typeof claims !== 'object') {
+		throw new Error('Token header or payload is not an object');
+	}
+	return { header, claims, signingInput: `${parts[0]}.${parts[1]}`, signature: base64UrlDecode(parts[2]) };
+}
+
+class OidcProvider {
+	constructor(config) {
+		this.config = config;
+		this.discovery = null;
+		this.discoveryFetchedAt = 0;
+		this.jwks = null;
+		this.jwksFetchedAt = 0;
 	}
 
-	function isSigninPage() {
-		return window.location.pathname === '/signin' || window.location.pathname === '/login';
+	async getDiscovery() {
+		if (this.discovery && Date.now() - this.discoveryFetchedAt < DISCOVERY_TTL_MS) {
+			return this.discovery;
+		}
+		const url = `${this.config.issuerUrl}/.well-known/openid-configuration`;
+		const discovery = await fetchJson(url);
+		// OpenID Connect Discovery 1.0, section 4.3: the issuer must match exactly.
+		if (stripTrailingSlash(String(discovery.issuer || '')) !== this.config.issuerUrl) {
+			throw new Error(
+				`Issuer mismatch: OIDC_ISSUER_URL is "${this.config.issuerUrl}" but the provider reports "${discovery.issuer}"`,
+			);
+		}
+		for (const field of ['authorization_endpoint', 'token_endpoint', 'jwks_uri']) {
+			if (typeof discovery[field] !== 'string') throw new Error(`Discovery document lacks ${field}`);
+		}
+		if (
+			this.config.usePkce &&
+			Array.isArray(discovery.code_challenge_methods_supported) &&
+			!discovery.code_challenge_methods_supported.includes('S256')
+		) {
+			throw new Error('Provider does not support PKCE S256; set OIDC_USE_PKCE=false to continue without it');
+		}
+		this.discovery = discovery;
+		this.discoveryFetchedAt = Date.now();
+		return discovery;
 	}
 
-	function displayError(form) {
-		var error = new URLSearchParams(window.location.search).get('error');
-		if (!error || !form || form.querySelector('#oidc-error')) return;
-
-		var errorDiv = document.createElement('div');
-		errorDiv.id = 'oidc-error';
-		errorDiv.style.cssText = 'background: var(--color-danger-tint-1, #fee); border: 1px solid var(--color-danger, #fcc); color: var(--color-danger, #c00); padding: 12px; border-radius: 4px; margin: 16px 0;';
-		errorDiv.textContent = decodeURIComponent(error);
-
-		var heading = form.querySelector('div[class*="_heading_"]');
-		if (heading) heading.after(errorDiv);
-		else form.prepend(errorDiv);
+	async getJwks(force = false) {
+		const age = Date.now() - this.jwksFetchedAt;
+		if (this.jwks && (!force ? age < JWKS_TTL_MS : age < JWKS_MIN_REFRESH_MS)) {
+			return this.jwks;
+		}
+		const discovery = await this.getDiscovery();
+		const jwks = await fetchJson(discovery.jwks_uri);
+		if (!Array.isArray(jwks.keys)) throw new Error('JWKS document has no keys');
+		this.jwks = jwks.keys.filter((key) => !key.use || key.use === 'sig');
+		this.jwksFetchedAt = Date.now();
+		return this.jwks;
 	}
 
-	function injectSsoButton() {
-		if (shouldShowNormalLogin()) return;
-		if (!isSigninPage()) return;
+	async findKey(header) {
+		const pick = (keys) => {
+			const spec = JWS_ALGORITHMS[header.alg];
+			const candidates = keys.filter((key) => key.kty === spec.kty && (!key.alg || key.alg === header.alg));
+			if (header.kid) return candidates.find((key) => key.kid === header.kid);
+			return candidates.length === 1 ? candidates[0] : undefined;
+		};
+		let key = pick(await this.getJwks());
+		if (!key) key = pick(await this.getJwks(true)); // key rotation
+		if (!key) throw new Error(`No signing key found for kid "${header.kid}"`);
+		return key;
+	}
 
-		var form = document.querySelector('[data-test-id="auth-form"]');
-		if (!form || form.querySelector('#oidc-sso-button')) return;
+	async buildAuthorizationUrl({ state, nonce, codeVerifier, redirectUri }) {
+		const discovery = await this.getDiscovery();
+		const url = new URL(discovery.authorization_endpoint);
+		url.searchParams.set('response_type', 'code');
+		url.searchParams.set('client_id', this.config.clientId);
+		url.searchParams.set('redirect_uri', redirectUri);
+		url.searchParams.set('scope', this.config.scopes);
+		url.searchParams.set('state', state);
+		url.searchParams.set('nonce', nonce);
+		if (codeVerifier) {
+			url.searchParams.set('code_challenge', pkceChallenge(codeVerifier));
+			url.searchParams.set('code_challenge_method', 'S256');
+		}
+		return url.toString();
+	}
 
-		// Find existing button to clone its classes
-		var existingButton = form.querySelector('[data-test-id="form-submit-button"]');
-		var buttonClasses = existingButton ? existingButton.className : '';
+	async exchangeCode({ code, codeVerifier, redirectUri }) {
+		const discovery = await this.getDiscovery();
+		const body = new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: redirectUri });
+		const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+		const { tokenAuthMethod, clientId, clientSecret } = this.config;
 
-		// Hide the form elements (inputs, buttons, forgot password)
-		form.querySelectorAll('div[class*="_inputsContainer_"], div[class*="_buttonsContainer_"], div[class*="_actionContainer_"]')
-			.forEach(function(el) { el.style.display = 'none'; });
-
-		// Create SSO button container
-		var ssoContainer = document.createElement('div');
-		ssoContainer.id = 'oidc-sso-container';
-		ssoContainer.style.cssText = 'text-align: center;';
-
-		// Create button - use cloned classes or fallback styles
-		var button = document.createElement('button');
-		button.id = 'oidc-sso-button';
-		button.type = 'button';
-		button.textContent = 'Sign in with SSO';
-		button.onclick = function() { window.location.href = '/auth/oidc/login'; };
-
-		if (buttonClasses) {
-			button.className = buttonClasses;
-			button.style.width = '100%';
+		if (tokenAuthMethod === 'client_secret_basic') {
+			// RFC 6749 2.3.1: both parts are form-urlencoded before base64.
+			const encode = (value) => encodeURIComponent(value).replace(/%20/g, '+');
+			headers.Authorization = `Basic ${Buffer.from(`${encode(clientId)}:${encode(clientSecret)}`).toString('base64')}`;
 		} else {
-			button.style.cssText = 'width: 100%; padding: 12px 24px; font-size: 14px; font-weight: 600; color: white; background: var(--color-primary, #ea4b30); border: none; border-radius: 4px; cursor: pointer;';
+			body.set('client_id', clientId);
+			if (tokenAuthMethod === 'client_secret_post') body.set('client_secret', clientSecret);
+		}
+		if (codeVerifier) body.set('code_verifier', codeVerifier);
+
+		const tokens = await fetchJson(discovery.token_endpoint, { method: 'POST', headers, body: body.toString() });
+		if (typeof tokens.id_token !== 'string') throw new Error('Token response has no id_token');
+		if (tokens.token_type && String(tokens.token_type).toLowerCase() !== 'bearer') {
+			throw new Error(`Unexpected token_type ${tokens.token_type}`);
+		}
+		return tokens;
+	}
+
+	/** Validates an ID token per OpenID Connect Core 1.0, section 3.1.3.7. */
+	async validateIdToken(idToken, expectedNonce, now = Date.now()) {
+		const discovery = await this.getDiscovery();
+		const { header, claims, signingInput, signature } = decodeJwt(idToken);
+
+		if (typeof header.alg !== 'string' || !JWS_ALGORITHMS[header.alg]) {
+			throw new Error(`ID token uses unsupported algorithm "${header.alg}"`);
+		}
+		const advertised = discovery.id_token_signing_alg_values_supported;
+		if (Array.isArray(advertised) && !advertised.includes(header.alg)) {
+			throw new Error(`ID token algorithm ${header.alg} is not advertised by the provider`);
+		}
+		const jwk = await this.findKey(header);
+		if (!verifyJwsSignature(header.alg, jwk, signingInput, signature)) {
+			throw new Error('ID token signature is invalid');
 		}
 
-		// Create admin link
-		var adminLink = document.createElement('p');
-		adminLink.style.cssText = 'margin-top: 16px; font-size: 12px; color: var(--color-text-light, #666);';
-		adminLink.innerHTML = 'Admin? <a href="?showLogin=true" style="color: var(--color-primary, #ea4b30);">Sign in with email</a>';
-
-		ssoContainer.appendChild(button);
-		ssoContainer.appendChild(adminLink);
-
-		// Insert after the heading
-		var heading = form.querySelector('div[class*="_heading_"]');
-		if (heading) heading.after(ssoContainer);
-		else form.prepend(ssoContainer);
-
-		displayError(form);
+		if (claims.iss !== discovery.issuer) throw new Error('ID token issuer does not match');
+		const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+		if (!audiences.includes(this.config.clientId)) throw new Error('ID token audience does not match');
+		if (audiences.length > 1 && claims.azp !== this.config.clientId) {
+			throw new Error('ID token azp does not match');
+		}
+		if (claims.azp !== undefined && claims.azp !== this.config.clientId) {
+			throw new Error('ID token azp does not match');
+		}
+		const nowSeconds = Math.floor(now / 1000);
+		if (typeof claims.exp !== 'number' || claims.exp + CLOCK_SKEW_SECONDS < nowSeconds) {
+			throw new Error('ID token has expired');
+		}
+		if (typeof claims.iat !== 'number' || claims.iat - CLOCK_SKEW_SECONDS > nowSeconds) {
+			throw new Error('ID token was issued in the future');
+		}
+		if (typeof claims.nbf === 'number' && claims.nbf - CLOCK_SKEW_SECONDS > nowSeconds) {
+			throw new Error('ID token is not valid yet');
+		}
+		if (!safeEqual(claims.nonce, expectedNonce)) throw new Error('ID token nonce does not match');
+		if (typeof claims.sub !== 'string' || claims.sub.length === 0 || claims.sub.length > 255) {
+			throw new Error('ID token has no usable sub');
+		}
+		return claims;
 	}
 
-	function observeAndInject() {
-		if (shouldShowNormalLogin() || !isSigninPage()) return;
-
-		injectSsoButton();
-
-		var observer = new MutationObserver(function() {
-			if (isSigninPage() && !shouldShowNormalLogin()) {
-				var form = document.querySelector('[data-test-id="auth-form"]');
-				if (form && !form.querySelector('#oidc-sso-button')) {
-					injectSsoButton();
-				}
-			}
-		});
-
-		observer.observe(document.body, { childList: true, subtree: true });
-		setTimeout(function() { observer.disconnect(); }, 10000);
+	async fetchUserInfo(accessToken) {
+		const discovery = await this.getDiscovery();
+		if (!discovery.userinfo_endpoint || !accessToken) return {};
+		return fetchJson(discovery.userinfo_endpoint, { headers: { Authorization: `Bearer ${accessToken}` } });
 	}
-
-	function handleNavigation() {
-		var origPush = history.pushState;
-		var origReplace = history.replaceState;
-
-		history.pushState = function() {
-			origPush.apply(this, arguments);
-			setTimeout(observeAndInject, 100);
-		};
-
-		history.replaceState = function() {
-			origReplace.apply(this, arguments);
-			setTimeout(observeAndInject, 100);
-		};
-
-		window.addEventListener('popstate', function() {
-			setTimeout(observeAndInject, 100);
-		});
-	}
-
-	if (document.readyState === 'loading') {
-		document.addEventListener('DOMContentLoaded', function() {
-			observeAndInject();
-			handleNavigation();
-		});
-	} else {
-		observeAndInject();
-		handleNavigation();
-	}
-
-	setTimeout(observeAndInject, 500);
-	setTimeout(observeAndInject, 1000);
-
-	console.log('[OIDC Hook] Frontend customization loaded');
-})();
-`;
 }
+
+// ---------------------------------------------------------------------------
+// Access policy (pure, unit tested)
+// ---------------------------------------------------------------------------
+
+/**
+ * Combines ID token and userinfo claims. Userinfo is only trusted when its sub
+ * matches the validated ID token (OpenID Connect Core 1.0, section 5.3.2).
+ */
+function mergeClaims(idClaims, userInfo) {
+	if (!userInfo || typeof userInfo !== 'object' || Object.keys(userInfo).length === 0) return { ...idClaims };
+	if (userInfo.sub !== idClaims.sub) throw new Error('userinfo sub does not match the ID token');
+	return { ...userInfo, ...idClaims };
+}
+
+/** Throws OidcLoginError when the claims are not allowed in. Returns a profile. */
+function evaluateAccess(claims, config) {
+	const email = typeof claims.email === 'string' ? claims.email.trim().toLowerCase() : undefined;
+	if (!isValidEmail(email)) throw new OidcLoginError('email_missing', 'No valid email claim');
+
+	if (isFalse(claims.email_verified)) {
+		throw new OidcLoginError('email_not_verified', `Email ${email} is marked unverified`);
+	}
+	const emailVerified = isTrue(claims.email_verified);
+
+	if (config.allowedEmailDomains.length) {
+		const domain = email.split('@').pop();
+		if (!config.allowedEmailDomains.includes(domain)) {
+			throw new OidcLoginError('access_denied', `Email domain ${domain} is not allowed`);
+		}
+	}
+
+	if (config.allowedGroups.length) {
+		const groups = claimToList(claims[config.groupsClaim]);
+		if (!groups.some((group) => config.allowedGroups.includes(group))) {
+			throw new OidcLoginError('access_denied', `${email} is in none of the allowed groups`);
+		}
+	}
+
+	const fullName = typeof claims.name === 'string' ? claims.name.trim() : '';
+	const [firstFromName, ...restFromName] = fullName ? fullName.split(/\s+/) : [];
+	return {
+		sub: claims.sub,
+		email,
+		emailVerified,
+		firstName: truncate(claims.given_name) || truncate(firstFromName) || truncate(claims.preferred_username) || 'User',
+		lastName: truncate(claims.family_name) || truncate(restFromName.join(' ')) || '',
+	};
+}
+
+// ---------------------------------------------------------------------------
+// n8n internals
+// ---------------------------------------------------------------------------
+
+function isN8nRoot(dir) {
+	try {
+		const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+		return pkg.name === 'n8n' ? pkg : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Finds the installed n8n package without hard-coding the Docker layout. */
+function findN8nRoot() {
+	const candidates = [];
+	if (process.env.OIDC_N8N_PACKAGE_DIR) candidates.push(process.env.OIDC_N8N_PACKAGE_DIR);
+	for (const entry of [require.main && require.main.filename, process.argv[1]]) {
+		if (!entry) continue;
+		let dir = path.dirname(fs.existsSync(entry) ? fs.realpathSync(entry) : entry);
+		for (let i = 0; i < 6; i++) {
+			candidates.push(dir);
+			const parent = path.dirname(dir);
+			if (parent === dir) break;
+			dir = parent;
+		}
+	}
+	candidates.push('/usr/local/lib/node_modules/n8n');
+	try {
+		candidates.push(path.dirname(require.resolve('n8n/package.json')));
+	} catch {}
+
+	for (const dir of candidates) {
+		const pkg = isN8nRoot(dir);
+		if (pkg) return { root: dir, version: pkg.version };
+	}
+	throw new Error('Could not locate the n8n package; set OIDC_N8N_PACKAGE_DIR');
+}
+
+/**
+ * Asks n8n's UrlService for the public instance URL, trying each place the class
+ * has lived in, and falls back to N8N_EDITOR_BASE_URL so a future move inside
+ * n8n does not switch the login off.
+ */
+function resolveInstanceBaseUrl(urlServiceLoaders, getInstance, env = process.env) {
+	for (const load of urlServiceLoaders) {
+		try {
+			const UrlService = load();
+			if (!UrlService) continue;
+			const url = getInstance(UrlService).getInstanceBaseUrl();
+			if (typeof url === 'string' && /^https?:\/\//.test(url)) return stripTrailingSlash(url);
+		} catch (error) {
+			log.debug('UrlService source unavailable:', String(error.message).split('\n')[0]);
+		}
+	}
+	if (env.N8N_EDITOR_BASE_URL && /^https?:\/\//.test(env.N8N_EDITOR_BASE_URL)) {
+		return stripTrailingSlash(env.N8N_EDITOR_BASE_URL);
+	}
+	return undefined;
+}
+
+function loadN8nInternals() {
+	const { root, version } = findN8nRoot();
+	const n8nRequire = createRequire(path.join(root, 'package.json'));
+	const fromDist = (relative, exportName) => {
+		const mod = n8nRequire(path.join(root, 'dist', relative));
+		if (!mod[exportName]) throw new Error(`${exportName} not found in dist/${relative}`);
+		return mod[exportName];
+	};
+
+	const { Container } = n8nRequire('@n8n/di');
+	const db = n8nRequire('@n8n/db');
+	for (const name of ['UserRepository', 'AuthIdentityRepository', 'AuthIdentity', 'GLOBAL_MEMBER_ROLE']) {
+		if (!db[name]) throw new Error(`@n8n/db does not export ${name}`);
+	}
+	const { GlobalConfig } = n8nRequire('@n8n/config');
+	const AuthService = fromDist('auth/auth.service.js', 'AuthService');
+	const OwnershipService = fromDist('services/ownership.service.js', 'OwnershipService');
+
+	// UrlService moved from n8n itself (<= 2.41) into @n8n/backend-services (>= 2.42).
+	const instanceBaseUrl = resolveInstanceBaseUrl(
+		[() => n8nRequire('@n8n/backend-services').UrlService, () => fromDist('services/url.service.js', 'UrlService')],
+		(UrlService) => Container.get(UrlService),
+	);
+	if (!instanceBaseUrl) {
+		log.warn('Could not read the instance URL from n8n; set N8N_EDITOR_BASE_URL or OIDC_REDIRECT_URI');
+	}
+
+	let encryptionKey;
+	try {
+		const { InstanceSettings } = n8nRequire('n8n-core');
+		encryptionKey = Container.get(InstanceSettings).encryptionKey;
+	} catch (error) {
+		log.debug('InstanceSettings unavailable:', error.message);
+	}
+
+	let eventService;
+	try {
+		eventService = Container.get(fromDist('events/event.service.js', 'EventService'));
+	} catch (error) {
+		log.debug('EventService unavailable, login events are not recorded:', error.message);
+	}
+
+	const globalConfig = Container.get(GlobalConfig);
+	return {
+		version,
+		authService: Container.get(AuthService),
+		ownershipService: Container.get(OwnershipService),
+		userRepository: Container.get(db.UserRepository),
+		authIdentityRepository: Container.get(db.AuthIdentityRepository),
+		AuthIdentity: db.AuthIdentity,
+		GLOBAL_MEMBER_ROLE: db.GLOBAL_MEMBER_ROLE,
+		cookieSecure: globalConfig.auth?.cookie?.secure !== false,
+		nonUiRoutes: String(globalConfig.endpoints?.additionalNonUIRoutes || '').split(':'),
+		instanceBaseUrl,
+		encryptionKey,
+		eventService,
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Account resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Finds or creates the n8n user for a verified OIDC profile.
+ * Order: linked identity (sub) -> existing account by verified email ->
+ * instance owner setup (OIDC_OWNER_EMAIL) -> auto-provisioned member.
+ */
+async function resolveUser(profile, config, n8n) {
+	const identity = await n8n.authIdentityRepository.findOne({
+		where: { providerId: profile.sub, providerType: PROVIDER_TYPE },
+		relations: { user: { role: true } },
+	});
+	if (identity && identity.user) return { user: identity.user, how: 'identity' };
+
+	const needsVerifiedEmail = () => {
+		if (config.requireEmailVerified && !profile.emailVerified) {
+			throw new OidcLoginError('email_not_verified', `Email ${profile.email} is not verified by the provider`);
+		}
+	};
+	const link = async (user) => {
+		await n8n.authIdentityRepository.save(
+			n8n.authIdentityRepository.create({ providerId: profile.sub, providerType: PROVIDER_TYPE, userId: user.id }),
+		);
+	};
+
+	const existing = await n8n.userRepository.findOne({
+		where: { email: profile.email },
+		relations: ['role'],
+	});
+	if (existing) {
+		// Linking by email hands over an existing account, so the provider must vouch for it.
+		needsVerifiedEmail();
+		await link(existing);
+		return { user: existing, how: 'linked' };
+	}
+
+	if (!(await n8n.ownershipService.hasInstanceOwner())) {
+		if (!config.ownerEmail || profile.email !== config.ownerEmail) {
+			throw new OidcLoginError('instance_not_setup', `Owner not set up; ${profile.email} is not OIDC_OWNER_EMAIL`);
+		}
+		needsVerifiedEmail();
+		const owner = await n8n.ownershipService.setupOwner({
+			email: profile.email,
+			firstName: profile.firstName,
+			lastName: profile.lastName || profile.firstName,
+			// Unusable random password; the owner signs in through OIDC.
+			password: randomToken(48),
+		});
+		await link(owner);
+		const user = await n8n.userRepository.findOne({ where: { id: owner.id }, relations: ['role'] });
+		return { user, how: 'owner-setup' };
+	}
+
+	if (!config.autoProvision) {
+		throw new OidcLoginError('not_provisioned', `${profile.email} has no n8n account and auto-provisioning is off`);
+	}
+	needsVerifiedEmail();
+
+	const user = await n8n.userRepository.manager.transaction(async (trx) => {
+		const { user: created } = await n8n.userRepository.createUserWithProject(
+			{
+				email: profile.email,
+				firstName: profile.firstName,
+				lastName: profile.lastName,
+				role: n8n.GLOBAL_MEMBER_ROLE,
+				password: randomToken(48),
+				authIdentities: [],
+			},
+			trx,
+		);
+		await trx.save(
+			trx.create(n8n.AuthIdentity, { providerId: profile.sub, providerType: PROVIDER_TYPE, userId: created.id }),
+		);
+		return created;
+	});
+	return { user, how: 'provisioned' };
+}
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
+function registerRoutes(app, { config, provider, n8n, cookieKey, redirectUri, baseUrl }) {
+	const txCookieOptions = {
+		httpOnly: true,
+		secure: n8n.cookieSecure,
+		// Must be lax: the provider redirects back with a cross-site top-level GET.
+		sameSite: 'lax',
+		path: TX_COOKIE_PATH,
+		maxAge: TX_MAX_AGE_SECONDS * 1000,
+	};
+	const fail = (res, code) => {
+		res.clearCookie(TX_COOKIE, { path: TX_COOKIE_PATH });
+		res.redirect(`${baseUrl}/signin?oidc_error=${encodeURIComponent(code)}`);
+	};
+
+	app.get(ROUTE_LOGIN, async (req, res) => {
+		try {
+			const state = randomToken();
+			const nonce = randomToken();
+			const codeVerifier = config.usePkce ? randomToken(48) : undefined;
+			const redirect = sanitizeRedirectPath(typeof req.query.redirect === 'string' ? req.query.redirect : '/');
+			const authorizationUrl = await provider.buildAuthorizationUrl({ state, nonce, codeVerifier, redirectUri });
+
+			res.cookie(TX_COOKIE, sealTransaction({ state, nonce, codeVerifier, redirect }, cookieKey), txCookieOptions);
+			res.set('Cache-Control', 'no-store');
+			res.redirect(authorizationUrl);
+		} catch (error) {
+			log.error('Could not start the login:', error.message);
+			fail(res, 'login_failed');
+		}
+	});
+
+	app.get(ROUTE_CALLBACK, async (req, res) => {
+		res.set('Cache-Control', 'no-store');
+		const tx = openTransaction(req.cookies && req.cookies[TX_COOKIE], cookieKey);
+		res.clearCookie(TX_COOKIE, { path: TX_COOKIE_PATH });
+		try {
+			if (typeof req.query.error === 'string') {
+				const code = req.query.error === 'access_denied' ? 'access_denied' : 'login_failed';
+				throw new OidcLoginError(code, `Provider returned error "${req.query.error.slice(0, 100)}"`);
+			}
+			if (!tx) throw new OidcLoginError('session_expired', 'Transaction cookie missing, expired or invalid');
+			if (!safeEqual(req.query.state, tx.state)) throw new OidcLoginError('session_expired', 'State mismatch');
+			if (typeof req.query.code !== 'string' || !req.query.code) throw new Error('Missing authorization code');
+			if (req.query.iss !== undefined && req.query.iss !== (await provider.getDiscovery()).issuer) {
+				throw new Error('Authorization response iss does not match (RFC 9207)');
+			}
+
+			const tokens = await provider.exchangeCode({ code: req.query.code, codeVerifier: tx.codeVerifier, redirectUri });
+			const idClaims = await provider.validateIdToken(tokens.id_token, tx.nonce);
+			let userInfo = {};
+			try {
+				userInfo = await provider.fetchUserInfo(tokens.access_token);
+			} catch (error) {
+				log.warn('userinfo request failed, continuing with ID token claims:', error.message);
+			}
+			const profile = evaluateAccess(mergeClaims(idClaims, userInfo), config);
+
+			const { user, how } = await resolveUser(profile, config, n8n);
+			if (!user) throw new Error('No user after resolution');
+			if (user.disabled) throw new OidcLoginError('user_disabled', `${profile.email} is disabled in n8n`);
+
+			// usedMfa=true: multi-factor authentication is the provider's job (passkeys in
+			// Pocket ID), as with n8n's licensed OIDC integration.
+			n8n.authService.issueCookie(res, user, true, req.browserId);
+			try {
+				n8n.eventService?.emit('user-logged-in', { user, authenticationMethod: 'oidc' });
+			} catch {}
+
+			log.info(`Signed in ${profile.email} (${how})`);
+			res.redirect(`${baseUrl}${tx.redirect || '/'}`);
+		} catch (error) {
+			const code = error instanceof OidcLoginError ? error.code : 'login_failed';
+			log.warn(`Login rejected (${code}): ${error.message}`);
+			try {
+				n8n.eventService?.emit('user-login-failed', {
+					userEmail: 'unknown',
+					authenticationMethod: 'oidc',
+					reason: code,
+				});
+			} catch {}
+			fail(res, code);
+		}
+	});
+
+	const frontendScript = buildFrontendScript({
+		loginUrl: `${baseUrl}${ROUTE_LOGIN}`,
+		buttonLabel: config.buttonLabel,
+		hidePasswordLogin: config.hidePasswordLogin,
+		autoRedirect: config.autoRedirect,
+		ownerSetup: Boolean(config.ownerEmail),
+	});
+	const frontendEtag = `"${crypto.createHash('sha256').update(frontendScript).digest('base64url').slice(0, 16)}"`;
+	app.get(ROUTE_FRONTEND, (req, res) => {
+		res.type('text/javascript; charset=utf-8');
+		res.set('Cache-Control', 'no-cache');
+		res.set('ETag', frontendEtag);
+		if (req.headers['if-none-match'] === frontendEtag) return res.status(304).end();
+		res.send(frontendScript);
+	});
+}
+
+// ---------------------------------------------------------------------------
+// Startup
+// ---------------------------------------------------------------------------
+
+async function setup(server) {
+	let loaded;
+	try {
+		loaded = loadConfig();
+	} catch (error) {
+		log.error(`Invalid configuration, OIDC login disabled: ${error.message}`);
+		return;
+	}
+	if (loaded.missing) {
+		log.warn(`Missing ${loaded.missing.join(', ')}; OIDC login disabled.`);
+		return;
+	}
+	const { config } = loaded;
+
+	let n8n;
+	try {
+		n8n = loadN8nInternals();
+	} catch (error) {
+		log.error(`Could not access n8n internals, OIDC login disabled: ${error.message}`);
+		return;
+	}
+
+	const baseUrl = n8n.instanceBaseUrl || (config.redirectUri ? new URL(config.redirectUri).origin : undefined);
+	if (!baseUrl) {
+		log.error('Cannot determine the n8n URL; set N8N_EDITOR_BASE_URL or OIDC_REDIRECT_URI. OIDC login disabled.');
+		return;
+	}
+	const redirectUri = config.redirectUri || `${baseUrl}${ROUTE_CALLBACK}`;
+	if (new URL(redirectUri).origin !== new URL(baseUrl).origin) {
+		log.warn(
+			`OIDC_REDIRECT_URI (${redirectUri}) and the n8n URL (${baseUrl}) differ; ` +
+				'set N8N_EDITOR_BASE_URL to the public URL, or users land on the wrong host after login.',
+		);
+	}
+	if (!process.env.N8N_EDITOR_BASE_URL) {
+		log.warn(`N8N_EDITOR_BASE_URL is not set; using ${baseUrl}. Set it when n8n runs behind a reverse proxy.`);
+	}
+
+	if (!n8n.nonUiRoutes.includes('auth')) {
+		log.error(
+			'N8N_ADDITIONAL_NON_UI_ROUTES must include "auth", otherwise the editor swallows /auth/oidc/*. OIDC login disabled.',
+		);
+		return;
+	}
+	if (!process.env.EXTERNAL_FRONTEND_HOOKS_URLS?.split(';').includes(ROUTE_FRONTEND)) {
+		log.warn(`EXTERNAL_FRONTEND_HOOKS_URLS does not contain ${ROUTE_FRONTEND}; no SSO button will be shown.`);
+	}
+
+	let secret = n8n.encryptionKey || process.env.N8N_ENCRYPTION_KEY;
+	if (!secret) {
+		log.warn('No n8n encryption key found; using a per-process key (logins in flight fail on restart).');
+		secret = crypto.randomBytes(32).toString('hex');
+	}
+
+	const provider = new OidcProvider(config);
+	try {
+		await provider.getDiscovery();
+	} catch (error) {
+		// Not fatal: the provider may simply be starting up. Retried on first login.
+		log.warn(`Provider discovery failed (will retry on login): ${error.message}`);
+	}
+
+	const app = server && server.app;
+	if (!app || typeof app.get !== 'function') {
+		log.error('The n8n server object has no express app; OIDC login disabled.');
+		return;
+	}
+	registerRoutes(app, { config, provider, n8n, cookieKey: deriveCookieKey(secret), redirectUri, baseUrl });
+
+	log.info(`v${HOOK_VERSION} active on n8n ${n8n.version}`);
+	log.info(`  issuer:       ${config.issuerUrl}`);
+	log.info(`  redirect URI: ${redirectUri}`);
+	log.info(
+		`  PKCE: ${config.usePkce ? 'on' : 'off'}, auto-provision: ${config.autoProvision ? 'on' : 'off'}, ` +
+			`groups: ${config.allowedGroups.join(', ') || '(any)'}, domains: ${config.allowedEmailDomains.join(', ') || '(any)'}`,
+	);
+	if (config.ownerEmail) log.info(`  owner setup via OIDC for ${config.ownerEmail}`);
+}
+
+// ---------------------------------------------------------------------------
+// Frontend script
+// ---------------------------------------------------------------------------
+
+function buildFrontendScript(options) {
+	// JSON in a script body: escape "<" so the config can never close a tag.
+	const json = JSON.stringify(options).replace(/</g, '\\u003c');
+	return `/* n8n-oidc ${HOOK_VERSION} */\n(${frontendMain.toString()})(${json});\n`;
+}
+
+/* Runs in the browser. Kept free of anything the server scope provides. */
+function frontendMain(cfg) {
+	'use strict';
+	var MESSAGES = {
+		login_failed: 'Sign-in failed. Please try again or contact your administrator.',
+		session_expired: 'The sign-in took too long or was started in another tab. Please try again.',
+		access_denied: 'Your account is not allowed to use this n8n instance.',
+		email_not_verified: 'Your email address is not verified by the identity provider.',
+		email_missing: 'The identity provider did not send an email address.',
+		not_provisioned: 'There is no n8n account for you yet. Ask an administrator to invite you.',
+		instance_not_setup: 'This n8n instance has not been set up yet. Only the configured owner can do that.',
+		user_disabled: 'Your n8n account is disabled.',
+	};
+	var BLOCK_ID = 'n8n-oidc-block';
+	var GUARD_KEY = 'n8n-oidc-auto-redirect-at';
+	// After a sign-out the sign-in page must not bounce to the provider, or signing
+	// out signs you straight back in. n8n reloads /signin after logging out, so the
+	// marker lives in sessionStorage; it is cleared by an explicit SSO click or by
+	// reaching the editor again.
+	var SIGNED_OUT_KEY = 'n8n-oidc-signed-out';
+	var autoRedirectDone = false;
+
+	function storage(action, key, value) {
+		try {
+			if (action === 'get') return sessionStorage.getItem(key);
+			if (action === 'set') sessionStorage.setItem(key, value);
+			if (action === 'remove') sessionStorage.removeItem(key);
+		} catch (e) {}
+		return null;
+	}
+	function markSignedOut() {
+		storage('set', SIGNED_OUT_KEY, '1');
+	}
+	if (isPath('/signout')) markSignedOut();
+
+	// The editor signs out with POST /rest/logout (axios uses XHR).
+	function noteRequest(url) {
+		if (typeof url === 'string' && /\/rest\/logout(\?|$)/.test(url)) markSignedOut();
+	}
+	try {
+		var originalOpen = XMLHttpRequest.prototype.open;
+		XMLHttpRequest.prototype.open = function (method, url) {
+			noteRequest(String(url));
+			return originalOpen.apply(this, arguments);
+		};
+		var originalFetch = window.fetch;
+		window.fetch = function (input) {
+			noteRequest(typeof input === 'string' ? input : input && input.url);
+			return originalFetch.apply(this, arguments);
+		};
+	} catch (e) {}
+
+	function params() {
+		return new URLSearchParams(window.location.search);
+	}
+	function isPath(p) {
+		return window.location.pathname.replace(/\/+$/, '').endsWith(p);
+	}
+	function wantsPasswordLogin() {
+		return params().get('showLogin') === 'true';
+	}
+	function loginHref() {
+		var redirect = params().get('redirect');
+		// n8n double-encodes this parameter (/signin?redirect=%252Fhome%252Fcredentials).
+		for (var i = 0; i < 2 && redirect && /^%2f/i.test(redirect); i++) {
+			try {
+				redirect = decodeURIComponent(redirect);
+			} catch (e) {
+				redirect = null;
+			}
+		}
+		if (redirect && redirect.charAt(0) === '/' && redirect.charAt(1) !== '/') {
+			return cfg.loginUrl + '?redirect=' + encodeURIComponent(redirect);
+		}
+		return cfg.loginUrl;
+	}
+
+	function buildBlock(formBox, showAdminLink) {
+		var block = document.createElement('div');
+		block.id = BLOCK_ID;
+		block.style.cssText = 'display:flex;flex-direction:column;gap:12px;margin:8px 0 16px;';
+
+		var code = params().get('oidc_error');
+		if (code) {
+			var alert = document.createElement('div');
+			alert.setAttribute('role', 'alert');
+			alert.style.cssText =
+				'padding:10px 12px;border-radius:6px;font-size:13px;line-height:1.4;' +
+				'background:var(--color-danger-tint-2,#fdecea);color:var(--color-danger,#c0392b);' +
+				'border:1px solid var(--color-danger-tint-1,#f5c6cb);';
+			alert.textContent = MESSAGES[code] || MESSAGES.login_failed;
+			block.appendChild(alert);
+		}
+
+		var submit = formBox.querySelector('[data-test-id="form-submit-button"]');
+		var button = document.createElement('button');
+		button.type = 'button';
+		button.setAttribute('data-test-id', 'oidc-login-button');
+		button.textContent = cfg.buttonLabel;
+		if (submit) {
+			button.className = submit.className;
+			button.style.width = '100%';
+		} else {
+			button.style.cssText =
+				'width:100%;padding:10px 16px;font-size:14px;font-weight:600;cursor:pointer;border:none;' +
+				'border-radius:6px;color:#fff;background:var(--color-primary,#ea4b30);';
+		}
+		button.addEventListener('click', function () {
+			button.disabled = true;
+			storage('remove', SIGNED_OUT_KEY);
+			window.location.href = loginHref();
+		});
+		block.appendChild(button);
+
+		if (showAdminLink) {
+			var p = document.createElement('p');
+			p.style.cssText = 'margin:0;text-align:center;font-size:12px;color:var(--color-text-light,#7d7d87);';
+			var a = document.createElement('a');
+			var q = params();
+			q.set('showLogin', 'true');
+			q.delete('oidc_error');
+			a.href = window.location.pathname + '?' + q.toString();
+			a.textContent = 'Sign in with email and password';
+			a.style.color = 'var(--color-primary,#ea4b30)';
+			p.appendChild(a);
+			block.appendChild(p);
+		} else {
+			var divider = document.createElement('div');
+			divider.style.cssText =
+				'display:flex;align-items:center;gap:8px;font-size:12px;color:var(--color-text-light,#7d7d87);';
+			var line1 = document.createElement('span');
+			var line2 = document.createElement('span');
+			line1.style.cssText = line2.style.cssText = 'flex:1;height:1px;background:var(--color-foreground-base,#dcdfe6);';
+			var label = document.createElement('span');
+			label.textContent = 'or';
+			divider.appendChild(line1);
+			divider.appendChild(label);
+			divider.appendChild(line2);
+			block.appendChild(divider);
+		}
+		return block;
+	}
+
+	function inject() {
+		var onSignout = isPath('/signout');
+		if (onSignout) markSignedOut();
+		var onSignin = isPath('/signin') || isPath('/login');
+		var onSetup = isPath('/setup') && cfg.ownerSetup;
+		var existing = document.getElementById(BLOCK_ID);
+		if (!onSignin && !onSetup) {
+			if (existing) existing.remove();
+			// Anywhere else in the editor means we are signed in again.
+			if (!onSignout && !isPath('/forgot-password') && !isPath('/change-password')) {
+				storage('remove', SIGNED_OUT_KEY);
+			}
+			return;
+		}
+		if (onSignin && maybeAutoRedirect()) return;
+		var formBox = document.querySelector('[data-test-id="auth-form"]');
+		if (!formBox || existing) return;
+
+		var hide = onSignin && cfg.hidePasswordLogin && !wantsPasswordLogin();
+		var children = Array.prototype.slice.call(formBox.children);
+		var heading = children.filter(function (el) {
+			return el.querySelector('h1,h2,h3,h4,[class*="heading"]');
+		})[0];
+		var block = buildBlock(formBox, hide);
+		if (heading) heading.insertAdjacentElement('afterend', block);
+		else formBox.insertBefore(block, formBox.firstChild);
+
+		if (hide) {
+			children.forEach(function (el) {
+				if (el !== heading && el !== block) el.style.display = 'none';
+			});
+		}
+	}
+
+	function maybeAutoRedirect() {
+		if (!cfg.autoRedirect || autoRedirectDone || storage('get', SIGNED_OUT_KEY)) return false;
+		if (wantsPasswordLogin() || params().get('oidc_error')) return false;
+		// Loop guard: if we bounced to the provider moments ago and are back here, stop.
+		try {
+			var last = Number(sessionStorage.getItem(GUARD_KEY) || 0);
+			if (Date.now() - last < 15000) return false;
+			sessionStorage.setItem(GUARD_KEY, String(Date.now()));
+		} catch (e) {}
+		autoRedirectDone = true;
+		window.location.replace(loginHref());
+		return true;
+	}
+
+	function start() {
+		inject();
+		new MutationObserver(inject).observe(document.body, { childList: true, subtree: true });
+	}
+
+	['pushState', 'replaceState'].forEach(function (name) {
+		var original = history[name];
+		history[name] = function () {
+			var result = original.apply(this, arguments);
+			setTimeout(inject, 0);
+			return result;
+		};
+	});
+	window.addEventListener('popstate', function () {
+		setTimeout(inject, 0);
+	});
+
+	if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+	else start();
+}
+
+// ---------------------------------------------------------------------------
+// Hook export
+// ---------------------------------------------------------------------------
+
+module.exports = {
+	n8n: {
+		ready: [
+			async function (server) {
+				try {
+					await setup(server);
+				} catch (error) {
+					// Never break n8n startup because of this hook.
+					log.error('Unexpected error during setup, OIDC login disabled:', error);
+				}
+			},
+		],
+	},
+};
+
+// For tests only. n8n iterates the exported object with Object.entries(), which
+// skips symbol keys, so this does not register as a hook.
+Object.defineProperty(module.exports, Symbol.for('n8n-oidc.internals'), {
+	value: {
+		loadConfig,
+		sanitizeRedirectPath,
+		sealTransaction,
+		openTransaction,
+		deriveCookieKey,
+		pkceChallenge,
+		verifyJwsSignature,
+		decodeJwt,
+		OidcProvider,
+		mergeClaims,
+		evaluateAccess,
+		resolveUser,
+		OidcLoginError,
+		buildFrontendScript,
+		findN8nRoot,
+		resolveInstanceBaseUrl,
+		HOOK_VERSION,
+	},
+});
