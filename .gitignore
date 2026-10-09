@@ -2,3 +2,6 @@ n8n-src
 n8n-data
 local-files
 .env
+node_modules
+.n8n-under-test
+screenshots

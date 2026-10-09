@@ -1,0 +1,20 @@
+{
+  "name": "n8n-oidc",
+  "version": "2.0.0",
+  "description": "Bolt-on OpenID Connect login (Pocket ID, Authentik, Keycloak, ...) for n8n Community Edition",
+  "private": true,
+  "license": "MIT",
+  "main": "hooks.js",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test test/unit.test.js",
+    "test:e2e": "node --test --test-timeout=400000 test/e2e.test.js",
+    "test:browser": "node --test --test-timeout=400000 test/browser.test.js",
+    "mock-idp": "node test/mock-idp.js"
+  },
+  "devDependencies": {
+    "puppeteer": "^25.13.0"
+  }
+}
