@@ -9,9 +9,11 @@ on:
       - Dockerfile
       - .dockerignore
       - docker/**
+      - CHANGELOG.md
       - .github/workflows/image.yml
   # main: after the "test" workflow passed for that push, publish the version in
-  # hooks.js (HOOK_VERSION) unless that tag already exists.
+  # hooks.js (HOOK_VERSION) unless that tag already exists, then make sure the
+  # GitHub release for it exists.
   workflow_run:
     workflows: [test]
     types: [completed]
@@ -28,6 +30,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+
+      # The release notes come from CHANGELOG.md, so a new version needs an entry.
+      - name: CHANGELOG has an entry for HOOK_VERSION
+        run: |
+          version=$(sed -n "s/^const HOOK_VERSION = '\(.*\)';$/\1/p" hooks.js)
+          grep -q "^## $version " CHANGELOG.md || {
+            echo "::error file=CHANGELOG.md::No '## $version - <date>' section for HOOK_VERSION $version"
+            exit 1
+          }
 
       - name: Build with the legacy builder (some NAS ship Docker without buildx)
         run: DOCKER_BUILDKIT=0 docker build -t n8n-oidc:legacy .
@@ -60,8 +71,10 @@ jobs:
        github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      packages: write
+      contents: write      # GitHub release
+      packages: write      # push to ghcr.io
+      id-token: write      # signing the provenance attestation
+      attestations: write
     env:
       IMAGE: ghcr.io/${{ github.repository }}
     steps:
@@ -115,6 +128,7 @@ jobs:
             type=raw,value=latest
 
       - if: steps.exists.outputs.skip == 'false'
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -123,3 +137,47 @@ jobs:
           build-args: VERSION=${{ steps.version.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # SBOM (list of contents) and detailed build provenance in the image index
+          sbom: true
+          provenance: mode=max
+
+      # Signed statement by GitHub: this digest was built from this repository,
+      # this commit and this workflow. Verify with:
+      #   gh attestation verify oci://ghcr.io/kavdau/n8n-oidc:<version> --owner kavdau
+      - if: steps.exists.outputs.skip == 'false'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # Runs after a publish and after a skip, so a missing release is also
+      # created for a version whose image already exists.
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          if gh release view "v$VERSION" > /dev/null 2>&1; then
+            echo "Release v$VERSION already exists" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # The section "## <version> - <date>" up to the next "## " heading.
+          awk -v v="$VERSION" '
+            $0 ~ "^## " v " " { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error file=CHANGELOG.md::No notes for $VERSION"
+            exit 1
+          fi
+          {
+            echo
+            echo "**Image:** \`$IMAGE:$VERSION\` (linux/amd64, linux/arm64)"
+            echo
+            echo "Verify: \`gh attestation verify oci://$IMAGE:$VERSION --owner ${{ github.repository_owner }}\`"
+          } >> notes.md
+          gh release create "v$VERSION" --target "$SHA" --title "v$VERSION" --notes-file notes.md
+          echo "Created release v$VERSION" >> "$GITHUB_STEP_SUMMARY"
