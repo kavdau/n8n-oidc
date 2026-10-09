@@ -139,11 +139,30 @@ test('a group member is provisioned and returned to the requested page', async (
 	assert.equal(me.body.role, 'global:member');
 });
 
-test('later logins resolve by sub even when the email changed at the provider', async () => {
+test('later logins resolve by sub and take over a changed name and email', async () => {
 	const first = await currentUser((await login(users.member)).auth);
-	const renamed = await login({ ...users.member, email: 'max.new@example.com' });
+	const renamed = await login({ ...users.member, email: 'max.new@example.com', given_name: 'Maximilian' });
 	const again = await currentUser(renamed.auth);
+	assert.equal(again.status, 200, 'the new session matches the new email');
 	assert.equal(again.body.id, first.body.id);
+	assert.equal(again.body.email, 'max.new@example.com');
+	assert.equal(again.body.firstName, 'Maximilian');
+	assert.match(stack.log, /Signed in max\.new@example\.com \(identity, updated firstName, email\)/);
+
+	// Back to the original values for the tests below.
+	const back = await currentUser((await login(users.member)).auth);
+	assert.equal(back.body.id, first.body.id);
+	assert.equal(back.body.email, users.member.email);
+	assert.equal(back.body.firstName, 'Max');
+});
+
+test('an email that another account already uses is not taken over', async () => {
+	const result = await login({ ...users.member, email: users.owner.email });
+	const me = await currentUser(result.auth);
+	assert.equal(me.status, 200, 'the login itself still works');
+	assert.equal(me.body.email, users.member.email);
+	assert.equal(me.body.role, 'global:member');
+	assert.match(stack.log, /Keeping email member@example\.com: another n8n account already uses owner@example\.com/);
 });
 
 test('users outside the allowed groups are rejected', async () => {

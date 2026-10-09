@@ -67,7 +67,7 @@ docker compose logs n8n | grep 'OIDC Hook'
 A working setup logs:
 
 ```
-[OIDC Hook] v2.0.2 active on n8n 2.42.6
+[OIDC Hook] v2.1.0 active on n8n 2.42.6
 [OIDC Hook]   issuer:       https://id.example.com
 [OIDC Hook]   redirect URI: https://n8n.example.com/auth/oidc/callback
 ```
@@ -86,6 +86,8 @@ read-only `oidc_hook` mount. Your n8n image stays as it is.
   Pocket ID reports the email as verified. Password login keeps working.
 - Everyone else in the allowed group gets a member account on first login
   (turn that off with `OIDC_AUTO_PROVISION=false`).
+- On every later sign-in, name and email follow what Pocket ID says (see
+  `OIDC_SYNC_PROFILE`).
 
 ## Configuration
 
@@ -119,6 +121,7 @@ read-only `oidc_hook` mount. Your n8n image stays as it is.
 | `OIDC_GROUPS_CLAIM` | `groups` | Claim that carries the groups |
 | `OIDC_ALLOWED_EMAIL_DOMAINS` | *(any)* | Comma-separated, exact match (`example.com` does not allow `sub.example.com`) |
 | `OIDC_AUTO_PROVISION` | `true` | Create member accounts on first login. If `false`, users must be invited first. |
+| `OIDC_SYNC_PROFILE` | `true` | On every sign-in, take over first name, last name and email from the provider. The email only changes when the provider marks it verified and no other n8n account uses it. Changing it signs the user out of their other n8n sessions. |
 | `OIDC_REQUIRE_EMAIL_VERIFIED` | `true` | Require `email_verified: true` before creating or linking an account. An explicit `false` is always rejected. |
 
 ### Sign-in page
@@ -150,8 +153,8 @@ was built from this repository by its own workflow, and the image carries an SBO
 (the list of its contents):
 
 ```bash
-gh attestation verify oci://ghcr.io/kavdau/n8n-oidc:2.0.2 --owner kavdau
-docker buildx imagetools inspect ghcr.io/kavdau/n8n-oidc:2.0.2 --format '{{ json .SBOM }}'
+gh attestation verify oci://ghcr.io/kavdau/n8n-oidc:2.1.0 --owner kavdau
+docker buildx imagetools inspect ghcr.io/kavdau/n8n-oidc:2.1.0 --format '{{ json .SBOM }}'
 ```
 
 `gh attestation verify` needs the GitHub CLI signed in (`gh auth login`).
@@ -176,7 +179,7 @@ services:
   n8n:
     volumes:
       - type: image
-        source: ghcr.io/kavdau/n8n-oidc:2.0.2
+        source: ghcr.io/kavdau/n8n-oidc:2.1.0
         target: /opt/n8n-oidc
         image:
           subpath: n8n-oidc
@@ -232,7 +235,9 @@ CSS class names.
   protect against code injection, CSRF and mix-up attacks.
 - **Account takeover protection:** an existing n8n account is only linked by email
   when the provider says the email is verified. After that the link uses the
-  immutable `sub`, so changing the email in Pocket ID does not move the account.
+  immutable `sub`, so changing the email in Pocket ID does not move the account;
+  the new address is only copied into n8n when it is verified and not used by
+  another n8n account.
 - **Owner setup** is restricted to `OIDC_OWNER_EMAIL`. Without it, a fresh instance
   can only be set up with the normal form. (The original "first user becomes owner"
   never triggered on n8n 2.x, see issue #7.)
@@ -268,6 +273,7 @@ docker logs n8n 2>&1 | grep 'OIDC Hook'
 | n8n does not start, log shows `EACCES: permission denied, open '/opt/n8n-oidc/hooks.js'` | Only with a plain file mount (the image sets the permissions itself). n8n runs as user `node` (UID 1000) and cannot read the mounted file. n8n loads hook files itself, so this happens before the hook can protect anything. `chmod 644 hooks.js` and `chmod 755` on its folder. On NAS systems with ACLs (`+` in `ls -l`), remove them first: `setfacl -b`. |
 | `Cannot read OIDC_CLIENT_SECRET_FILE` | Same permission problem for the secret: `chown 1000:1000` and `chmod 400` the file. |
 | `OIDC login disabled` | The line before it says why: a missing variable, `N8N_ADDITIONAL_NON_UI_ROUTES` without `auth`, or n8n internals not found after an update. n8n keeps running with the normal login. |
+| `Keeping email …` in the log | Profile sync did not change the email: it is not verified at the provider, or another n8n account uses it. The login itself works. |
 | Log says `Signed in … (provisioned)` but you expected your existing account | The email at the provider differs from the email of your n8n account, so a new member was created. Delete it in **Settings → Users**, make both emails match, and sign in again; the log then says `(linked)`. Set `OIDC_AUTO_PROVISION=false` if only invited users should get in. |
 | `email_not_verified` | The provider does not report the email as verified. Verify it there; only set `OIDC_REQUIRE_EMAIL_VERIFIED=false` if you trust every email the provider hands out. |
 | `session_expired` right after signing in | The transaction cookie did not survive the round trip, usually because `N8N_SECURE_COOKIE` is on while n8n is reached over plain HTTP, or the login was started in another tab. |
@@ -294,7 +300,7 @@ n8n 2.x, but they are not a public API.
 Requires Node 24 (what n8n 2.x needs).
 
 ```bash
-node --test test/unit.test.js          # 33 unit tests, no dependencies
+node --test test/unit.test.js          # 38 unit tests, no dependencies
 task test-e2e                          # installs n8n from npm, then e2e + browser tests
 ```
 
@@ -303,7 +309,7 @@ Or by hand:
 ```bash
 mkdir -p .n8n-under-test && (cd .n8n-under-test && echo '{}' > package.json && npm i n8n@stable)
 export N8N_BIN=$PWD/.n8n-under-test/node_modules/n8n/bin/n8n
-node --test test/e2e.test.js           # real n8n + mock provider, 22 scenarios
+node --test test/e2e.test.js           # real n8n + mock provider, 23 scenarios
 npm install && node --test test/browser.test.js   # headless Chrome against the real editor
 ```
 
@@ -323,6 +329,7 @@ nonce or audience, expired tokens, `alg: none`.
 | ID token | decoded, not verified | signature and all claims verified |
 | PKCE | no | S256 |
 | Account linking | by email, unverified | by `sub`, email only when verified |
+| Profile | set once | name and verified email kept in sync |
 | Owner | "first user", never triggered on 2.x | `OIDC_OWNER_EMAIL` |
 | Access control | none | groups, email domains, auto-provision switch |
 | Errors | provider text in the URL | fixed codes and messages |

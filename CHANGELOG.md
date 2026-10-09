@@ -3,6 +3,20 @@
 Each version is published as a GitHub release and as the Docker image
 `ghcr.io/kavdau/n8n-oidc:<version>`. The release notes are taken from this file.
 
+## 2.1.0 - 2026-10-09
+
+- New: profile sync. On every sign-in of an existing account, first name, last
+  name and email are taken over from the provider, so a change in Pocket ID shows
+  up in n8n at the next login. On by default; `OIDC_SYNC_PROFILE=false` turns it off.
+  - The email only changes when the provider marks it verified and no other n8n
+    account uses it; otherwise the old address stays (logged as `Keeping email …`)
+    and the login goes ahead.
+  - Names the provider does not send are left alone.
+  - n8n ties its session to the email, so changing it signs the user out of their
+    other n8n sessions.
+- The log shows the n8n account and what changed, e.g.
+  `Signed in jane@example.com (identity, updated lastName)`.
+
 ## 2.0.2 - 2026-10-09
 
 The hook itself is unchanged from 2.0.1; this release is about the image.

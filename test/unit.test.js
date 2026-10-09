@@ -55,6 +55,7 @@ test('loadConfig defaults', () => {
 	assert.equal(config.usePkce, true);
 	assert.equal(config.scopes, 'openid email profile');
 	assert.equal(config.autoProvision, true);
+	assert.equal(config.syncProfile, true);
 	assert.equal(config.requireEmailVerified, true);
 	assert.equal(config.hidePasswordLogin, false);
 	assert.equal(config.autoRedirect, false);
@@ -337,7 +338,26 @@ test('evaluateAccess normalises the profile', () => {
 		{ sub: 's', email: ' Jane@Example.COM ', email_verified: true, given_name: 'Jane', family_name: 'Doe' },
 		baseConfig,
 	);
-	assert.deepEqual(profile, { sub: 's', email: 'jane@example.com', emailVerified: true, firstName: 'Jane', lastName: 'Doe' });
+	assert.deepEqual(profile, {
+		sub: 's',
+		email: 'jane@example.com',
+		emailVerified: true,
+		firstName: 'Jane',
+		lastName: 'Doe',
+		nameClaims: { firstName: 'Jane', lastName: 'Doe' },
+	});
+});
+
+test('evaluateAccess only reports names the provider actually sent', () => {
+	const names = (claims) => t.evaluateAccess({ sub: 's', email: 'a@b.de', ...claims }, baseConfig).nameClaims;
+	assert.deepEqual(names({ given_name: 'Ada', family_name: 'Lovelace' }), { firstName: 'Ada', lastName: 'Lovelace' });
+	// An empty family_name is a statement: the last name is empty.
+	assert.deepEqual(names({ given_name: 'Ada', family_name: '' }), { firstName: 'Ada', lastName: '' });
+	assert.deepEqual(names({ name: 'Ada King Lovelace' }), { firstName: 'Ada', lastName: 'King Lovelace' });
+	// Nothing about the last name: keep whatever n8n has.
+	assert.deepEqual(names({ given_name: 'Ada' }), { firstName: 'Ada', lastName: undefined });
+	// The preferred_username / "User" fallbacks are for new accounts only, never synced.
+	assert.deepEqual(names({ preferred_username: 'ada' }), { firstName: undefined, lastName: undefined });
 });
 
 test('evaluateAccess falls back to name and preferred_username and truncates', () => {
@@ -390,6 +410,7 @@ test('mergeClaims only trusts userinfo with the same sub', () => {
 function fakeN8n({ users = [], identities = [], ownerSetUp = true } = {}) {
 	const created = [];
 	const savedIdentities = [];
+	const updates = [];
 	const n8n = {
 		GLOBAL_MEMBER_ROLE: { slug: 'global:member' },
 		AuthIdentity: class {},
@@ -403,6 +424,10 @@ function fakeN8n({ users = [], identities = [], ownerSetUp = true } = {}) {
 		},
 		userRepository: {
 			findOne: async ({ where }) => users.find((u) => (where.email ? u.email === where.email : u.id === where.id)) || null,
+			update: async ({ id }, changes) => {
+				updates.push({ id, ...changes });
+				Object.assign(users.find((u) => u.id === id), changes);
+			},
 			createUserWithProject: async (data) => {
 				const user = { id: `u${users.length + 1}`, ...data };
 				users.push(user);
@@ -427,7 +452,7 @@ function fakeN8n({ users = [], identities = [], ownerSetUp = true } = {}) {
 			},
 		},
 	};
-	return { n8n, created, savedIdentities, users };
+	return { n8n, created, savedIdentities, updates, users };
 }
 
 const profile = { sub: 'sub-1', email: 'jane@example.com', emailVerified: true, firstName: 'Jane', lastName: 'Doe' };
@@ -488,6 +513,61 @@ test('resolveUser provisions members unless disabled', async () => {
 	const relaxed = fakeN8n();
 	const r = await t.resolveUser({ ...profile, emailVerified: false }, { ...baseConfig, requireEmailVerified: false }, relaxed.n8n);
 	assert.equal(r.how, 'provisioned');
+});
+
+// ---------------------------------------------------------------------------
+
+const stored = () => ({ id: 'u1', email: 'jane@example.com', firstName: 'Jane', lastName: 'Doe' });
+const syncConfig = { ...baseConfig, syncProfile: true };
+const fromProvider = (claims) => t.evaluateAccess({ sub: 'sub-1', email_verified: true, ...claims }, syncConfig);
+
+test('syncProfile changes nothing when the provider agrees', async () => {
+	const { n8n, updates } = fakeN8n({ users: [stored()] });
+	const user = await n8n.userRepository.findOne({ where: { id: 'u1' } });
+	const fields = await t.syncProfile(user, fromProvider({ email: 'jane@example.com', given_name: 'Jane', family_name: 'Doe' }), syncConfig, n8n);
+	assert.deepEqual(fields, []);
+	assert.deepEqual(updates, []);
+});
+
+test('syncProfile takes over name and verified email, and updates the user object', async () => {
+	const { n8n, updates } = fakeN8n({ users: [stored()] });
+	const user = await n8n.userRepository.findOne({ where: { id: 'u1' } });
+	const fields = await t.syncProfile(
+		user,
+		fromProvider({ email: 'Jane.Smith@Example.com', given_name: 'Jane', family_name: 'Smith' }),
+		syncConfig,
+		n8n,
+	);
+	assert.deepEqual(fields.sort(), ['email', 'lastName']);
+	assert.deepEqual(updates, [{ id: 'u1', lastName: 'Smith', email: 'jane.smith@example.com' }]);
+	// issueCookie() hashes the email, so the object in hand must already carry the new one.
+	assert.equal(user.email, 'jane.smith@example.com');
+});
+
+test('syncProfile keeps the email when it is unverified or taken, but still syncs names', async () => {
+	const unverified = fakeN8n({ users: [stored()] });
+	const u1 = await unverified.n8n.userRepository.findOne({ where: { id: 'u1' } });
+	const profile = t.evaluateAccess(
+		{ sub: 'sub-1', email: 'new@example.com', given_name: 'Janet', family_name: 'Doe' },
+		{ ...syncConfig, requireEmailVerified: false },
+	);
+	assert.deepEqual(await t.syncProfile(u1, profile, syncConfig, unverified.n8n), ['firstName']);
+	assert.equal(u1.email, 'jane@example.com');
+
+	const taken = fakeN8n({ users: [stored(), { id: 'u2', email: 'boss@example.com' }] });
+	const u2 = await taken.n8n.userRepository.findOne({ where: { id: 'u1' } });
+	assert.deepEqual(await t.syncProfile(u2, fromProvider({ email: 'boss@example.com', given_name: 'Jane', family_name: 'Doe' }), syncConfig, taken.n8n), []);
+	assert.equal(u2.email, 'jane@example.com');
+});
+
+test('syncProfile keeps names the provider does not send, and can be switched off', async () => {
+	const { n8n, updates } = fakeN8n({ users: [stored()] });
+	const user = await n8n.userRepository.findOne({ where: { id: 'u1' } });
+	assert.deepEqual(await t.syncProfile(user, fromProvider({ email: 'jane@example.com', preferred_username: 'jd' }), syncConfig, n8n), []);
+
+	const off = { ...syncConfig, syncProfile: false };
+	assert.deepEqual(await t.syncProfile(user, fromProvider({ email: 'x@example.com', given_name: 'X', family_name: 'Y' }), off, n8n), []);
+	assert.deepEqual(updates, []);
 });
 
 // ---------------------------------------------------------------------------
