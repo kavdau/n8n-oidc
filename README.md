@@ -25,6 +25,7 @@ against the current n8n `stable` and `next` releases.
 - [How it works](#how-it-works)
 - [Security](#security)
 - [Limitations](#limitations)
+- [Troubleshooting](#troubleshooting)
 - [Upgrading n8n](#upgrading-n8n)
 - [Development and tests](#development-and-tests)
 - [What changed since the original](#what-changed-since-the-original)
@@ -61,7 +62,7 @@ docker compose logs n8n | grep 'OIDC Hook'
 A working setup logs:
 
 ```
-[OIDC Hook] v2.0.0 active on n8n 2.42.6
+[OIDC Hook] v2.0.1 active on n8n 2.42.6
 [OIDC Hook]   issuer:       https://id.example.com
 [OIDC Hook]   redirect URI: https://n8n.example.com/auth/oidc/callback
 ```
@@ -183,6 +184,24 @@ CSS class names.
   and n8n's own SSO settings page stays locked. It is an independent implementation
   that uses n8n's public external hooks plus some internal services.
 
+## Troubleshooting
+
+Every decision the hook makes is logged with the prefix `[OIDC Hook]`:
+
+```bash
+docker logs n8n 2>&1 | grep 'OIDC Hook'
+```
+
+| Symptom | Cause and fix |
+| --- | --- |
+| n8n does not start, log shows `EACCES: permission denied, open '/opt/n8n-oidc/hooks.js'` | n8n runs as user `node` (UID 1000) and cannot read the mounted file. n8n loads hook files itself, so this happens before the hook can protect anything. `chmod 644 hooks.js` and `chmod 755` on its folder. On NAS systems with ACLs (`+` in `ls -l`), remove them first: `setfacl -b`. |
+| `Cannot read OIDC_CLIENT_SECRET_FILE` | Same permission problem for the secret: `chown 1000:1000` and `chmod 400` the file. |
+| `OIDC login disabled` | The line before it says why: a missing variable, `N8N_ADDITIONAL_NON_UI_ROUTES` without `auth`, or n8n internals not found after an update. n8n keeps running with the normal login. |
+| Log says `Signed in … (provisioned)` but you expected your existing account | The email at the provider differs from the email of your n8n account, so a new member was created. Delete it in **Settings → Users**, make both emails match, and sign in again; the log then says `(linked)`. Set `OIDC_AUTO_PROVISION=false` if only invited users should get in. |
+| `email_not_verified` | The provider does not report the email as verified. Verify it there; only set `OIDC_REQUIRE_EMAIL_VERIFIED=false` if you trust every email the provider hands out. |
+| `session_expired` right after signing in | The transaction cookie did not survive the round trip, usually because `N8N_SECURE_COOKIE` is on while n8n is reached over plain HTTP, or the login was started in another tab. |
+| `X-Forwarded-For` errors in the log | Not from the hook: n8n does not know it is behind a proxy. Set `N8N_PROXY_HOPS=1`. |
+
 ## Upgrading n8n
 
 The hook relies on a few n8n internals: `AuthService`, `OwnershipService`, the
@@ -201,7 +220,7 @@ n8n 2.x, but they are not a public API.
 Requires Node 24 (what n8n 2.x needs).
 
 ```bash
-node --test test/unit.test.js          # 32 unit tests, no dependencies
+node --test test/unit.test.js          # 33 unit tests, no dependencies
 task test-e2e                          # installs n8n from npm, then e2e + browser tests
 ```
 

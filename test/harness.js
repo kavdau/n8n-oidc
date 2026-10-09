@@ -65,7 +65,7 @@ async function startStack({ n8nPort = 5688, idpPort = 9999, env = {} } = {}) {
 	child.stderr.on('data', (chunk) => (log += chunk));
 
 	const deadline = Date.now() + 180_000;
-	while (!log.includes('[OIDC Hook] v2.0.0 active')) {
+	while (!/\[OIDC Hook\] v[\d.]+ active/.test(log)) {
 		if (child.exitCode !== null) throw new Error(`n8n exited early:\n${log.slice(-4000)}`);
 		if (log.includes('OIDC login disabled')) throw new Error(`Hook disabled itself:\n${log.slice(-4000)}`);
 		if (Date.now() > deadline) throw new Error(`n8n did not get ready:\n${log.slice(-4000)}`);

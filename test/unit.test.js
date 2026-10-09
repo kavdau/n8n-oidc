@@ -492,6 +492,38 @@ test('resolveUser provisions members unless disabled', async () => {
 
 // ---------------------------------------------------------------------------
 
+test('resolveInstanceBaseUrl tries every UrlService location, then N8N_EDITOR_BASE_URL', () => {
+	const service = (url) => class {
+		getInstanceBaseUrl() {
+			return url;
+		}
+	};
+	const get = (Cls) => new Cls();
+	const missing = () => {
+		throw new Error("Cannot find module '@n8n/backend-services'");
+	};
+
+	// n8n >= 2.42: the first location works.
+	assert.equal(t.resolveInstanceBaseUrl([() => service('https://n8n.example.com/'), missing], get, {}), 'https://n8n.example.com');
+	// n8n <= 2.41: the package is missing, the old dist path works.
+	assert.equal(t.resolveInstanceBaseUrl([missing, () => service('https://old.example.com')], get, {}), 'https://old.example.com');
+	// A future move: nothing found, but N8N_EDITOR_BASE_URL is set (the case that disabled the hook).
+	assert.equal(
+		t.resolveInstanceBaseUrl([missing, missing], get, { N8N_EDITOR_BASE_URL: 'https://workflow.example.com/' }),
+		'https://workflow.example.com',
+	);
+	// Garbage from the service is ignored in favour of the variable.
+	assert.equal(
+		t.resolveInstanceBaseUrl([() => service(undefined)], get, { N8N_EDITOR_BASE_URL: 'https://workflow.example.com' }),
+		'https://workflow.example.com',
+	);
+	// Nothing usable at all.
+	assert.equal(t.resolveInstanceBaseUrl([missing], get, {}), undefined);
+	assert.equal(t.resolveInstanceBaseUrl([missing], get, { N8N_EDITOR_BASE_URL: 'workflow.example.com' }), undefined);
+});
+
+// ---------------------------------------------------------------------------
+
 test('frontend script embeds config safely and parses', () => {
 	const script = t.buildFrontendScript({ loginUrl: '/auth/oidc/login', buttonLabel: '</script><script>alert(1)</script>' });
 	assert.ok(!script.includes('</script>'));
