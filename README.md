@@ -140,7 +140,9 @@ read-only `oidc_hook` mount. Your n8n image stays as it is.
 
 `ghcr.io/kavdau/n8n-oidc` contains `hooks.js` and nothing else (no n8n). Tags
 follow the hook version: `2.0.1`, `2.0`, `2`, `latest`. It is built for
-`linux/amd64` and `linux/arm64`, only after the tests passed.
+`linux/amd64` and `linux/arm64`, only after the tests passed. A published version
+is never overwritten, so `2.0.1` always means the same image; a new image needs a
+new `HOOK_VERSION` in `hooks.js`.
 
 There are three ways to get `hooks.js` into n8n. All use the official n8n image.
 
