@@ -67,7 +67,7 @@ docker compose logs n8n | grep 'OIDC Hook'
 A working setup logs:
 
 ```
-[OIDC Hook] v2.1.0 active on n8n 2.42.6
+[OIDC Hook] v2.1.1 active on n8n 2.42.6
 [OIDC Hook]   issuer:       https://id.example.com
 [OIDC Hook]   redirect URI: https://n8n.example.com/auth/oidc/callback
 ```
@@ -153,8 +153,8 @@ was built from this repository by its own workflow, and the image carries an SBO
 (the list of its contents):
 
 ```bash
-gh attestation verify oci://ghcr.io/kavdau/n8n-oidc:2.1.0 --owner kavdau
-docker buildx imagetools inspect ghcr.io/kavdau/n8n-oidc:2.1.0 --format '{{ json .SBOM }}'
+gh attestation verify oci://ghcr.io/kavdau/n8n-oidc:2.1.1 --owner kavdau
+docker buildx imagetools inspect ghcr.io/kavdau/n8n-oidc:2.1.1 --format '{{ json .SBOM }}'
 ```
 
 `gh attestation verify` needs the GitHub CLI signed in (`gh auth login`).
@@ -179,7 +179,7 @@ services:
   n8n:
     volumes:
       - type: image
-        source: ghcr.io/kavdau/n8n-oidc:2.1.0
+        source: ghcr.io/kavdau/n8n-oidc:2.1.1
         target: /opt/n8n-oidc
         image:
           subpath: n8n-oidc

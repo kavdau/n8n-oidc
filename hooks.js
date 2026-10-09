@@ -23,7 +23,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { createRequire } = require('node:module');
 
-const HOOK_VERSION = '2.1.0';
+const HOOK_VERSION = '2.1.1';
 const LOG_PREFIX = '[OIDC Hook]';
 const PROVIDER_TYPE = 'oidc';
 
@@ -813,7 +813,12 @@ async function syncProfile(user, profile, config, n8n) {
 
 	const fields = Object.keys(changes);
 	if (!fields.length) return [];
-	await n8n.userRepository.update({ id: user.id }, changes);
+	// save() on the loaded entity, like n8n's own UserService.update(): only then do
+	// n8n's entity subscribers see the old row and rename the personal project
+	// ("First Last <email>") as well. update() skips that and n8n logs a warning.
+	const current = await n8n.userRepository.findOneBy({ id: user.id });
+	if (!current) throw new Error(`user ${user.id} no longer exists`);
+	await n8n.userRepository.save({ ...current, ...changes }, { transaction: true });
 	// The session cookie is derived from these values, so the object must match the database.
 	Object.assign(user, changes);
 	try {

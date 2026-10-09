@@ -3,6 +3,13 @@
 Each version is published as a GitHub release and as the Docker image
 `ghcr.io/kavdau/n8n-oidc:<version>`. The release notes are taken from this file.
 
+## 2.1.1 - 2026-10-09
+
+- Fix: profile sync now saves the user the way n8n itself does, so n8n also renames
+  the user's personal project ("First Last <email>"). 2.1.0 changed the name and
+  email correctly, but n8n logged `Could not update the personal project's name`
+  and kept the old project name.
+
 ## 2.1.0 - 2026-10-09
 
 - New: profile sync. On every sign-in of an existing account, first name, last

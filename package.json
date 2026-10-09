@@ -1,6 +1,6 @@
 {
   "name": "n8n-oidc",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Bolt-on OpenID Connect login (Pocket ID, Authentik, Keycloak, ...) for n8n Community Edition",
   "private": true,
   "license": "MIT",
