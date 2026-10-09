@@ -23,7 +23,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { createRequire } = require('node:module');
 
-const HOOK_VERSION = '2.0.0';
+const HOOK_VERSION = '2.0.1';
 const LOG_PREFIX = '[OIDC Hook]';
 const PROVIDER_TYPE = 'oidc';
 
@@ -604,6 +604,28 @@ function findN8nRoot() {
 	throw new Error('Could not locate the n8n package; set OIDC_N8N_PACKAGE_DIR');
 }
 
+/**
+ * Asks n8n's UrlService for the public instance URL, trying each place the class
+ * has lived in, and falls back to N8N_EDITOR_BASE_URL so a future move inside
+ * n8n does not switch the login off.
+ */
+function resolveInstanceBaseUrl(urlServiceLoaders, getInstance, env = process.env) {
+	for (const load of urlServiceLoaders) {
+		try {
+			const UrlService = load();
+			if (!UrlService) continue;
+			const url = getInstance(UrlService).getInstanceBaseUrl();
+			if (typeof url === 'string' && /^https?:\/\//.test(url)) return stripTrailingSlash(url);
+		} catch (error) {
+			log.debug('UrlService source unavailable:', String(error.message).split('\n')[0]);
+		}
+	}
+	if (env.N8N_EDITOR_BASE_URL && /^https?:\/\//.test(env.N8N_EDITOR_BASE_URL)) {
+		return stripTrailingSlash(env.N8N_EDITOR_BASE_URL);
+	}
+	return undefined;
+}
+
 function loadN8nInternals() {
 	const { root, version } = findN8nRoot();
 	const n8nRequire = createRequire(path.join(root, 'package.json'));
@@ -622,12 +644,13 @@ function loadN8nInternals() {
 	const AuthService = fromDist('auth/auth.service.js', 'AuthService');
 	const OwnershipService = fromDist('services/ownership.service.js', 'OwnershipService');
 
-	let instanceBaseUrl;
-	try {
-		const { UrlService } = n8nRequire('@n8n/backend-services');
-		instanceBaseUrl = stripTrailingSlash(Container.get(UrlService).getInstanceBaseUrl());
-	} catch (error) {
-		log.warn(`Could not read the instance URL from n8n (${error.message}); set OIDC_REDIRECT_URI`);
+	// UrlService moved from n8n itself (<= 2.41) into @n8n/backend-services (>= 2.42).
+	const instanceBaseUrl = resolveInstanceBaseUrl(
+		[() => n8nRequire('@n8n/backend-services').UrlService, () => fromDist('services/url.service.js', 'UrlService')],
+		(UrlService) => Container.get(UrlService),
+	);
+	if (!instanceBaseUrl) {
+		log.warn('Could not read the instance URL from n8n; set N8N_EDITOR_BASE_URL or OIDC_REDIRECT_URI');
 	}
 
 	let encryptionKey;
@@ -1190,6 +1213,7 @@ Object.defineProperty(module.exports, Symbol.for('n8n-oidc.internals'), {
 		OidcLoginError,
 		buildFrontendScript,
 		findN8nRoot,
+		resolveInstanceBaseUrl,
 		HOOK_VERSION,
 	},
 });
