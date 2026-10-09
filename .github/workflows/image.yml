@@ -1,0 +1,125 @@
+name: image
+
+on:
+  # Pull requests: build the image (also with the legacy builder) and check that
+  # it copies hooks.js and turns healthy. Nothing is published.
+  pull_request:
+    paths:
+      - hooks.js
+      - Dockerfile
+      - .dockerignore
+      - docker/**
+      - .github/workflows/image.yml
+  # main: after the "test" workflow passed for that push, publish the version in
+  # hooks.js (HOOK_VERSION) unless that tag already exists.
+  workflow_run:
+    workflows: [test]
+    types: [completed]
+    branches: [main]
+  # Manual run from main (same rules: an existing version is not overwritten).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build with the legacy builder (some NAS ship Docker without buildx)
+        run: DOCKER_BUILDKIT=0 docker build -t n8n-oidc:legacy .
+
+      - name: Build
+        run: docker build -t n8n-oidc:test .
+
+      - name: Copies hooks.js, turns healthy, stops at once
+        run: |
+          docker volume create oidc-test
+          docker run -d --name sidecar -v oidc-test:/out n8n-oidc:test
+          status=starting
+          for _ in $(seq 30); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' sidecar)
+            [ "$status" = healthy ] && break
+            sleep 2
+          done
+          docker logs sidecar
+          test "$status" = healthy
+          docker run --rm -v oidc-test:/out:ro --entrypoint cat n8n-oidc:test /out/hooks.js | cmp - hooks.js
+          start=$(date +%s)
+          docker stop sidecar
+          test $(( $(date +%s) - start )) -lt 5
+
+  publish:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The commit the tests ran on, not whatever main points to now.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Read the hook version
+        id: version
+        run: |
+          version=$(sed -n "s/^const HOOK_VERSION = '\(.*\)';$/\1/p" hooks.js)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A published version is never overwritten: 2.0.1 always means the same image.
+      # Pushes that do not raise HOOK_VERSION (README, tests, ...) end here.
+      - name: Skip if this version is already published
+        id: exists
+        run: |
+          tag="$IMAGE:${{ steps.version.outputs.version }}"
+          if docker buildx imagetools inspect "$tag" > /dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$tag already exists, nothing published. Raise HOOK_VERSION in hooks.js to publish a new image."
+            echo "$tag already exists, nothing published. Raise \`HOOK_VERSION\` in \`hooks.js\` to publish a new image." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Publishing $tag" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - if: steps.exists.outputs.skip == 'false'
+        uses: docker/setup-qemu-action@v4
+      - if: steps.exists.outputs.skip == 'false'
+        uses: docker/setup-buildx-action@v4
+
+      - if: steps.exists.outputs.skip == 'false'
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}},value=v${{ steps.version.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ steps.version.outputs.version }}
+            type=semver,pattern={{major}},value=v${{ steps.version.outputs.version }}
+            type=raw,value=latest
+
+      - if: steps.exists.outputs.skip == 'false'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: VERSION=${{ steps.version.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
