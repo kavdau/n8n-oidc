@@ -1,7 +1,7 @@
 # Sidecar image: carries hooks.js and nothing else.
 #
 # It does not change n8n. On start it copies hooks.js into a shared volume and
-# exits; the official, unmodified n8n image mounts that volume read-only.
+# then idles; the official, unmodified n8n image mounts that volume read-only.
 # See "Docker image" in the README.
 
 FROM busybox:1.38.0
@@ -16,9 +16,12 @@ LABEL org.opencontainers.image.title="n8n-oidc" \
 # COPY + RUN chmod instead of COPY --chmod: works with the legacy builder too
 # (some NAS systems ship Docker without BuildKit/buildx).
 COPY hooks.js /n8n-oidc/hooks.js
-RUN chmod 644 /n8n-oidc/hooks.js
+COPY docker/sidecar.sh /usr/local/bin/n8n-oidc-sidecar
+RUN chmod 644 /n8n-oidc/hooks.js && chmod 755 /usr/local/bin/n8n-oidc-sidecar
 
-# Copy on every start (a named volume is only pre-filled once, so an update would
-# otherwise keep the old file). Write to a temp name and rename, so n8n never
-# sees a half-written file.
-CMD ["sh", "-c", "set -e; cp /n8n-oidc/hooks.js /out/.hooks.js.tmp; chmod 644 /out/.hooks.js.tmp; mv -f /out/.hooks.js.tmp /out/hooks.js; echo \"n8n-oidc: $(grep -o \"HOOK_VERSION = '[^']*'\" /out/hooks.js) copied to /out/hooks.js\""]
+# Healthy once the volume holds exactly this image's hooks.js, so n8n can wait
+# for it with depends_on: condition: service_healthy.
+HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=3 \
+  CMD cmp -s /n8n-oidc/hooks.js /out/hooks.js
+
+CMD ["/usr/local/bin/n8n-oidc-sidecar"]

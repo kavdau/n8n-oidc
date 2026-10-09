@@ -1,3 +1,4 @@
-# Only hooks.js goes into the image.
+# Only hooks.js and the sidecar script go into the image.
 *
 !hooks.js
+!docker/sidecar.sh
