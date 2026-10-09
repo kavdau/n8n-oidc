@@ -22,7 +22,9 @@ const users = {
 async function startStack({ n8nPort = 5688, idpPort = 9999, env = {} } = {}) {
 	const n8nBin = process.env.N8N_BIN;
 	if (!n8nBin) throw new Error('Set N8N_BIN to the n8n bin/n8n script');
-	const base = `http://localhost:${n8nPort}`;
+	// 127.0.0.1, not localhost: CI runners resolve localhost to ::1 first, and both
+	// servers below only listen on IPv4.
+	const base = `http://127.0.0.1:${n8nPort}`;
 
 	const idp = createMockIdp({ port: idpPort, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, redirectUri: `${base}/auth/oidc/callback` });
 	await idp.listen();
@@ -37,7 +39,7 @@ async function startStack({ n8nPort = 5688, idpPort = 9999, env = {} } = {}) {
 			N8N_PORT: String(n8nPort),
 			N8N_LISTEN_ADDRESS: '127.0.0.1',
 			N8N_RUNNERS_BROKER_PORT: String(n8nPort + 1000),
-			N8N_HOST: 'localhost',
+			N8N_HOST: '127.0.0.1',
 			N8N_PROTOCOL: 'http',
 			N8N_EDITOR_BASE_URL: base,
 			N8N_SECURE_COOKIE: 'false',

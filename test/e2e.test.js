@@ -66,8 +66,11 @@ test.before(async () => {
 });
 
 test.after(async () => {
-	if (process.env.E2E_PRINT_LOG === 'true' && stack) console.log(stack.log);
-	if (stack) await stack.stop();
+	if (!stack) return;
+	// Always show the hook's own log lines: when a run fails in CI, they say why.
+	const log = process.env.E2E_PRINT_LOG === 'true' ? stack.log : stack.log.split('\n').filter((line) => line.includes('[OIDC Hook]')).join('\n');
+	console.log(`\n--- n8n log ---\n${log}\n---------------`);
+	await stack.stop();
 });
 
 // The order matters: the instance starts without an owner.

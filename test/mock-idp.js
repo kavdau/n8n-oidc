@@ -11,7 +11,7 @@ const crypto = require('node:crypto');
 const http = require('node:http');
 
 function createMockIdp({ port, clientId, clientSecret, redirectUri }) {
-	const issuer = `http://localhost:${port}`;
+	const issuer = `http://127.0.0.1:${port}`;
 	const signingKey = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
 	const rogueKey = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
 	const kid = 'test-key-1';
@@ -210,7 +210,7 @@ if (require.main === module) {
 		port: Number(process.env.PORT || 9999),
 		clientId: process.env.CLIENT_ID || 'n8n',
 		clientSecret: process.env.CLIENT_SECRET || 'secret',
-		redirectUri: process.env.REDIRECT_URI || 'http://localhost:5678/auth/oidc/callback',
+		redirectUri: process.env.REDIRECT_URI || 'http://127.0.0.1:5678/auth/oidc/callback',
 	});
 	idp.listen().then(() => console.log(`mock IdP on ${idp.issuer}`));
 }
