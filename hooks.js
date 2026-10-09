@@ -23,7 +23,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { createRequire } = require('node:module');
 
-const HOOK_VERSION = '2.0.2';
+const HOOK_VERSION = '2.1.0';
 const LOG_PREFIX = '[OIDC Hook]';
 const PROVIDER_TYPE = 'oidc';
 
@@ -162,6 +162,7 @@ function loadConfig(env = process.env) {
 				d.toLowerCase().replace(/^@/, ''),
 			),
 			autoProvision: parseBool(readEnv('OIDC_AUTO_PROVISION', env), true),
+			syncProfile: parseBool(readEnv('OIDC_SYNC_PROFILE', env), true),
 			requireEmailVerified: parseBool(readEnv('OIDC_REQUIRE_EMAIL_VERIFIED', env), true),
 			ownerEmail: ownerEmail ? ownerEmail.toLowerCase() : undefined,
 			buttonLabel: readEnv('OIDC_BUTTON_LABEL', env) || 'Sign in with SSO',
@@ -556,12 +557,26 @@ function evaluateAccess(claims, config) {
 
 	const fullName = typeof claims.name === 'string' ? claims.name.trim() : '';
 	const [firstFromName, ...restFromName] = fullName ? fullName.split(/\s+/) : [];
+
+	// Names as the provider states them, for keeping existing accounts in sync.
+	// undefined means "the provider said nothing", so the n8n value is kept.
+	const nameClaims = {
+		firstName: truncate(claims.given_name) || truncate(firstFromName),
+		lastName:
+			typeof claims.family_name === 'string'
+				? truncate(claims.family_name) || ''
+				: fullName
+					? truncate(restFromName.join(' ')) || ''
+					: undefined,
+	};
+
 	return {
 		sub: claims.sub,
 		email,
 		emailVerified,
-		firstName: truncate(claims.given_name) || truncate(firstFromName) || truncate(claims.preferred_username) || 'User',
-		lastName: truncate(claims.family_name) || truncate(restFromName.join(' ')) || '',
+		firstName: nameClaims.firstName || truncate(claims.preferred_username) || 'User',
+		lastName: nameClaims.lastName || '',
+		nameClaims,
 	};
 }
 
@@ -765,6 +780,48 @@ async function resolveUser(profile, config, n8n) {
 	return { user, how: 'provisioned' };
 }
 
+/**
+ * Brings an existing account in line with the provider: first and last name, and
+ * the email address. Returns the names of the changed fields.
+ *
+ * The email only follows when the provider marks it verified and no other n8n
+ * account uses it; otherwise the old address stays and the login goes ahead.
+ * Changing the email also ends the user's other n8n sessions, because n8n ties
+ * its session cookie to the address.
+ */
+async function syncProfile(user, profile, config, n8n) {
+	if (!config.syncProfile) return [];
+	const changes = {};
+
+	const { firstName, lastName } = profile.nameClaims || {};
+	if (firstName !== undefined && firstName !== (user.firstName || '')) changes.firstName = firstName;
+	if (lastName !== undefined && lastName !== (user.lastName || '')) changes.lastName = lastName;
+
+	const currentEmail = String(user.email || '').toLowerCase();
+	if (profile.email !== currentEmail) {
+		if (!profile.emailVerified) {
+			log.warn(`Keeping email ${currentEmail}: ${profile.email} is not verified by the provider`);
+		} else {
+			const owner = await n8n.userRepository.findOne({ where: { email: profile.email } });
+			if (owner && owner.id !== user.id) {
+				log.warn(`Keeping email ${currentEmail}: another n8n account already uses ${profile.email}`);
+			} else {
+				changes.email = profile.email;
+			}
+		}
+	}
+
+	const fields = Object.keys(changes);
+	if (!fields.length) return [];
+	await n8n.userRepository.update({ id: user.id }, changes);
+	// The session cookie is derived from these values, so the object must match the database.
+	Object.assign(user, changes);
+	try {
+		n8n.eventService?.emit('user-updated', { user, fieldsChanged: fields });
+	} catch {}
+	return fields;
+}
+
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
@@ -830,6 +887,15 @@ function registerRoutes(app, { config, provider, n8n, cookieKey, redirectUri, ba
 			if (!user) throw new Error('No user after resolution');
 			if (user.disabled) throw new OidcLoginError('user_disabled', `${profile.email} is disabled in n8n`);
 
+			let updated = [];
+			if (how === 'identity' || how === 'linked') {
+				try {
+					updated = await syncProfile(user, profile, config, n8n);
+				} catch (error) {
+					log.warn(`Could not update the profile of ${user.email}, signing in anyway: ${error.message}`);
+				}
+			}
+
 			// usedMfa=true: multi-factor authentication is the provider's job (passkeys in
 			// Pocket ID), as with n8n's licensed OIDC integration.
 			n8n.authService.issueCookie(res, user, true, req.browserId);
@@ -837,7 +903,8 @@ function registerRoutes(app, { config, provider, n8n, cookieKey, redirectUri, ba
 				n8n.eventService?.emit('user-logged-in', { user, authenticationMethod: 'oidc' });
 			} catch {}
 
-			log.info(`Signed in ${profile.email} (${how})`);
+			// The n8n account, which can differ from the provider's address (see syncProfile).
+			log.info(`Signed in ${user.email} (${how}${updated.length ? `, updated ${updated.join(', ')}` : ''})`);
 			res.redirect(`${baseUrl}${tx.redirect || '/'}`);
 		} catch (error) {
 			const code = error instanceof OidcLoginError ? error.code : 'login_failed';
@@ -948,6 +1015,7 @@ async function setup(server) {
 	log.info(`  redirect URI: ${redirectUri}`);
 	log.info(
 		`  PKCE: ${config.usePkce ? 'on' : 'off'}, auto-provision: ${config.autoProvision ? 'on' : 'off'}, ` +
+			`profile sync: ${config.syncProfile ? 'on' : 'off'}, ` +
 			`groups: ${config.allowedGroups.join(', ') || '(any)'}, domains: ${config.allowedEmailDomains.join(', ') || '(any)'}`,
 	);
 	if (config.ownerEmail) log.info(`  owner setup via OIDC for ${config.ownerEmail}`);
@@ -1210,6 +1278,7 @@ Object.defineProperty(module.exports, Symbol.for('n8n-oidc.internals'), {
 		mergeClaims,
 		evaluateAccess,
 		resolveUser,
+		syncProfile,
 		OidcLoginError,
 		buildFrontendScript,
 		findN8nRoot,
