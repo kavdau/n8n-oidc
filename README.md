@@ -11,6 +11,8 @@ standards-compliant provider.
   (`AuthIdentity`, keyed by the provider's `sub`)
 - Never stops n8n from starting: on any problem the hook disables itself and the
   normal login keeps working
+- Leaves n8n untouched: you keep running the official n8n image; a 4 MB side
+  container only delivers `hooks.js`
 
 > This is a fork of [cweagans/n8n-oidc](https://github.com/cweagans/n8n-oidc),
 > reworked for n8n 2.x. See [What changed](#what-changed-since-the-original).
@@ -22,6 +24,7 @@ against the current n8n `stable` and `next` releases.
 
 - [Quick start with Pocket ID](#quick-start-with-pocket-id)
 - [Configuration](#configuration)
+- [Docker image](#docker-image)
 - [How it works](#how-it-works)
 - [Security](#security)
 - [Limitations](#limitations)
@@ -52,8 +55,10 @@ then refuses the login before it ever reaches n8n.
 ### 2. Run n8n with the hook
 
 ```bash
-git clone https://github.com/kavdau/n8n-oidc.git && cd n8n-oidc
-cp .env.example .env                       # fill in host, issuer, client id, owner email
+mkdir n8n && cd n8n
+curl -fsSLO https://raw.githubusercontent.com/kavdau/n8n-oidc/main/docker-compose.yml
+curl -fsSL https://raw.githubusercontent.com/kavdau/n8n-oidc/main/.env.example -o .env
+# edit .env: host, issuer, client id, owner email
 mkdir -p secrets && printf '%s' 'PASTE-CLIENT-SECRET' > secrets/oidc_client_secret
 docker compose up -d
 docker compose logs n8n | grep 'OIDC Hook'
@@ -67,9 +72,10 @@ A working setup logs:
 [OIDC Hook]   redirect URI: https://n8n.example.com/auth/oidc/callback
 ```
 
-Already running n8n? Add the three hook variables and the `OIDC_*` variables to
-your existing service, and mount `hooks.js` read-only. That is all the compose
-file does.
+Already running n8n? Add the `n8n-oidc` service and the `oidc_hook` volume from
+the [example compose file](docker-compose.yml), then give your n8n service the
+three hook variables, the `OIDC_*` variables, `depends_on: [n8n-oidc]` and the
+read-only `oidc_hook` mount. Your n8n image stays as it is.
 
 ### 3. Sign in
 
@@ -129,6 +135,57 @@ file does.
 | --- | --- |
 | `OIDC_DEBUG=true` | Extra log lines |
 | `OIDC_N8N_PACKAGE_DIR` | Path of the n8n package, if the hook cannot find it (non-Docker installs) |
+
+## Docker image
+
+`ghcr.io/kavdau/n8n-oidc` contains `hooks.js` and nothing else (no n8n). Tags
+follow the hook version: `2.0.1`, `2.0`, `2`, `latest`. It is built for
+`linux/amd64` and `linux/arm64`, only after the tests passed.
+
+There are three ways to get `hooks.js` into n8n. All use the official n8n image.
+
+**1. Side container (recommended, works everywhere).** This is what the example
+compose file does. On start the container copies `hooks.js` into the volume
+`oidc_hook` and then idles (under 1 MB of RAM), so NAS interfaces such as UGOS,
+Synology or Portainer do not show the stack as failed. Its health check reports
+*healthy* once the volume holds exactly its own `hooks.js`.
+
+Use the plain `depends_on: [n8n-oidc]`. Some NAS interfaces hang on
+`condition: service_healthy`, and it is not needed: copying takes milliseconds,
+n8n needs seconds before it loads the hook, and the file is replaced atomically.
+
+**2. Image volume (Docker Engine 28 or newer, plain `docker compose`).** No side
+container at all; n8n mounts the file straight from the image:
+
+```yaml
+services:
+  n8n:
+    volumes:
+      - type: image
+        source: ghcr.io/kavdau/n8n-oidc:2.0.1
+        target: /opt/n8n-oidc
+        image:
+          subpath: n8n-oidc
+```
+
+Some NAS interfaces reject this (UGOS: "image is not allowed"); use option 1 there.
+
+**3. Plain file.** Download `hooks.js` from a pinned commit and mount it
+read-only to `/opt/n8n-oidc/hooks.js`. It must be readable for UID 1000, see
+[Troubleshooting](#troubleshooting).
+
+**Updating the hook** is a tag change: set the new `n8n-oidc` tag, then
+`docker compose pull && docker compose up -d`.
+
+**Building it yourself:**
+
+```bash
+docker build -t n8n-oidc:dev "https://github.com/kavdau/n8n-oidc.git#main"
+```
+
+The Dockerfile also works with the legacy builder that some NAS systems ship
+without buildx. For a locally built image, add `pull_policy: never` to the
+`n8n-oidc` service so Compose does not look for it online.
 
 ## How it works
 
@@ -194,13 +251,16 @@ docker logs n8n 2>&1 | grep 'OIDC Hook'
 
 | Symptom | Cause and fix |
 | --- | --- |
-| n8n does not start, log shows `EACCES: permission denied, open '/opt/n8n-oidc/hooks.js'` | n8n runs as user `node` (UID 1000) and cannot read the mounted file. n8n loads hook files itself, so this happens before the hook can protect anything. `chmod 644 hooks.js` and `chmod 755` on its folder. On NAS systems with ACLs (`+` in `ls -l`), remove them first: `setfacl -b`. |
+| n8n does not start, log shows `EACCES: permission denied, open '/opt/n8n-oidc/hooks.js'` | Only with a plain file mount (the image sets the permissions itself). n8n runs as user `node` (UID 1000) and cannot read the mounted file. n8n loads hook files itself, so this happens before the hook can protect anything. `chmod 644 hooks.js` and `chmod 755` on its folder. On NAS systems with ACLs (`+` in `ls -l`), remove them first: `setfacl -b`. |
 | `Cannot read OIDC_CLIENT_SECRET_FILE` | Same permission problem for the secret: `chown 1000:1000` and `chmod 400` the file. |
 | `OIDC login disabled` | The line before it says why: a missing variable, `N8N_ADDITIONAL_NON_UI_ROUTES` without `auth`, or n8n internals not found after an update. n8n keeps running with the normal login. |
 | Log says `Signed in … (provisioned)` but you expected your existing account | The email at the provider differs from the email of your n8n account, so a new member was created. Delete it in **Settings → Users**, make both emails match, and sign in again; the log then says `(linked)`. Set `OIDC_AUTO_PROVISION=false` if only invited users should get in. |
 | `email_not_verified` | The provider does not report the email as verified. Verify it there; only set `OIDC_REQUIRE_EMAIL_VERIFIED=false` if you trust every email the provider hands out. |
 | `session_expired` right after signing in | The transaction cookie did not survive the round trip, usually because `N8N_SECURE_COOKIE` is on while n8n is reached over plain HTTP, or the login was started in another tab. |
-| `X-Forwarded-For` errors in the log | Not from the hook: n8n does not know it is behind a proxy. Set `N8N_PROXY_HOPS=1`. |
+| `X-Forwarded-For` errors in the log | Not from the hook: n8n does not know it is behind a proxy. Set `N8N_PROXY_HOPS` to the number of proxies in front of n8n (`1` for one reverse proxy, `2` for Cloudflare plus Traefik). |
+| The NAS interface hangs at "deploying" | `depends_on` with `condition: service_healthy`. Use the plain form `depends_on: [n8n-oidc]`, see [Docker image](#docker-image). |
+| `image is not allowed` in the NAS interface | It does not support image volumes (`type: image`). Use the side container. |
+| `pull access denied for n8n-oidc` | A locally built image without `pull_policy: never`, or the build has not finished. Check with `docker images n8n-oidc`. |
 
 ## Upgrading n8n
 
@@ -254,7 +314,8 @@ nonce or audience, expired tokens, `alg: none`.
 
 Environment variable names and the callback URL are unchanged, so an existing
 setup keeps working after replacing `hooks.js` (add `N8N_EDITOR_BASE_URL` if it is
-not set).
+not set). The fork additionally ships `hooks.js` as a Docker image, so the n8n
+image itself never has to be changed.
 
 ## License
 

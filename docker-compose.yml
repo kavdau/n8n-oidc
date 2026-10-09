@@ -1,18 +1,31 @@
 # Example: n8n Community Edition with OIDC login through Pocket ID.
 # Put n8n behind your reverse proxy (TLS) and fill in .env (see .env.example).
+#
+# n8n runs from the official, unmodified image. The small n8n-oidc container
+# only delivers hooks.js into the shared volume oidc_hook (see README "Docker image").
 
 services:
+  n8n-oidc:
+    image: ghcr.io/kavdau/n8n-oidc:2.0.1
+    restart: unless-stopped
+    network_mode: none
+    volumes:
+      - oidc_hook:/out
+
   n8n:
     # Pin the version you tested; the hook uses n8n internals. See README "Upgrading".
     image: docker.n8n.io/n8nio/n8n:2.42.6
     restart: unless-stopped
+    depends_on:
+      - n8n-oidc
     ports:
       - "127.0.0.1:5678:5678"
     environment:
       N8N_HOST: ${N8N_HOST}
       N8N_PROTOCOL: https
       N8N_EDITOR_BASE_URL: https://${N8N_HOST}
-      WEBHOOK_URL: https://${N8N_HOST}/
+      N8N_WEBHOOK_URL: https://${N8N_HOST}/
+      # Number of reverse proxies in front of n8n (e.g. 2 for Cloudflare + Traefik).
       N8N_PROXY_HOPS: 1
       GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-Europe/Berlin}
 
@@ -33,7 +46,7 @@ services:
       - oidc_client_secret
     volumes:
       - n8n_data:/home/node/.n8n
-      - ./hooks.js:/opt/n8n-oidc/hooks.js:ro
+      - oidc_hook:/opt/n8n-oidc:ro
 
 secrets:
   oidc_client_secret:
@@ -41,3 +54,4 @@ secrets:
 
 volumes:
   n8n_data:
+  oidc_hook:
