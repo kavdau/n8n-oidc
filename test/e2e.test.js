@@ -56,6 +56,12 @@ async function currentUser(authCookie) {
 	return { status: response.status, body: response.status === 200 ? (await response.json()).data : null };
 }
 
+async function personalProjectName(authCookie) {
+	const response = await fetch(`${BASE}/rest/projects/personal`, { headers: { Cookie: `n8n-auth=${authCookie}` } });
+	assert.equal(response.status, 200);
+	return (await response.json()).data.name;
+}
+
 function errorCode(location) {
 	return new URL(location, BASE).searchParams.get('oidc_error');
 }
@@ -148,6 +154,9 @@ test('later logins resolve by sub and take over a changed name and email', async
 	assert.equal(again.body.email, 'max.new@example.com');
 	assert.equal(again.body.firstName, 'Maximilian');
 	assert.match(stack.log, /Signed in max\.new@example\.com \(identity, updated firstName, email\)/);
+	// n8n renames the personal project along with the user, as when the user edits the profile.
+	assert.equal(await personalProjectName(renamed.auth), 'Maximilian Member <max.new@example.com>');
+	assert.doesNotMatch(stack.log, /Could not update the personal project's name/);
 
 	// Back to the original values for the tests below.
 	const back = await currentUser((await login(users.member)).auth);
