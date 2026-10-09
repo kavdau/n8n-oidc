@@ -13,7 +13,10 @@ LABEL org.opencontainers.image.title="n8n-oidc" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="${VERSION}"
 
-COPY --chmod=644 hooks.js /n8n-oidc/hooks.js
+# COPY + RUN chmod instead of COPY --chmod: works with the legacy builder too
+# (some NAS systems ship Docker without BuildKit/buildx).
+COPY hooks.js /n8n-oidc/hooks.js
+RUN chmod 644 /n8n-oidc/hooks.js
 
 # Copy on every start (a named volume is only pre-filled once, so an update would
 # otherwise keep the old file). Write to a temp name and rename, so n8n never
