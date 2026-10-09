@@ -67,7 +67,7 @@ docker compose logs n8n | grep 'OIDC Hook'
 A working setup logs:
 
 ```
-[OIDC Hook] v2.0.1 active on n8n 2.42.6
+[OIDC Hook] v2.0.2 active on n8n 2.42.6
 [OIDC Hook]   issuer:       https://id.example.com
 [OIDC Hook]   redirect URI: https://n8n.example.com/auth/oidc/callback
 ```
@@ -142,7 +142,19 @@ read-only `oidc_hook` mount. Your n8n image stays as it is.
 follow the hook version: `2.0.1`, `2.0`, `2`, `latest`. It is built for
 `linux/amd64` and `linux/arm64`, only after the tests passed. A published version
 is never overwritten, so `2.0.1` always means the same image; a new image needs a
-new `HOOK_VERSION` in `hooks.js`.
+new `HOOK_VERSION` in `hooks.js` and an entry in the [changelog](CHANGELOG.md).
+Every version also gets a [GitHub release](../../releases) with those notes.
+
+**Verifying the image.** From 2.0.2 on, GitHub signs a statement that the image
+was built from this repository by its own workflow, and the image carries an SBOM
+(the list of its contents):
+
+```bash
+gh attestation verify oci://ghcr.io/kavdau/n8n-oidc:2.0.2 --owner kavdau
+docker buildx imagetools inspect ghcr.io/kavdau/n8n-oidc:2.0.2 --format '{{ json .SBOM }}'
+```
+
+`gh attestation verify` needs the GitHub CLI signed in (`gh auth login`).
 
 There are three ways to get `hooks.js` into n8n. All use the official n8n image.
 
@@ -164,7 +176,7 @@ services:
   n8n:
     volumes:
       - type: image
-        source: ghcr.io/kavdau/n8n-oidc:2.0.1
+        source: ghcr.io/kavdau/n8n-oidc:2.0.2
         target: /opt/n8n-oidc
         image:
           subpath: n8n-oidc
@@ -294,6 +306,9 @@ export N8N_BIN=$PWD/.n8n-under-test/node_modules/n8n/bin/n8n
 node --test test/e2e.test.js           # real n8n + mock provider, 22 scenarios
 npm install && node --test test/browser.test.js   # headless Chrome against the real editor
 ```
+
+Dependabot proposes updates for the GitHub Actions, the busybox base image, the
+example compose file and puppeteer every Monday; each one has to pass the tests.
 
 `test/mock-idp.js` is a small provider that behaves like Pocket ID (RS256, PKCE,
 `email_verified`, `groups`) and can misbehave on purpose: forged signatures, wrong
