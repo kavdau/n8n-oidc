@@ -1,0 +1,3 @@
+# Only hooks.js goes into the image.
+*
+!hooks.js
